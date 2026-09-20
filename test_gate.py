@@ -110,6 +110,47 @@ with tempfile.TemporaryDirectory() as d:
           "blocklists" not in plain_ctx.get("security_graph", {}))
     check("callers that pass no graph behave exactly as before", legacy_ctx == plain_ctx)
     check("the graph never adds a 'taint' key — nothing can be RAISED from it, only suppressed", "taint" not in sg)
+
+# A wrong edge could SUPPRESS a real finding, so ambiguity must link to nothing.
+AMBIG = {
+    "a/safe.ts": NL.join(["export const blockedProps = new Set(['__proto__', 'constructor', 'prototype']);",
+                          "export function sanitizeKey(k: string) { return !blockedProps.has(k); }", ""]),
+    "b/other.ts": NL.join(["export function sanitizeKey(k: string) { return k.trim(); }   // same NAME, enforces nothing", ""]),
+    "app/uses_pkg.ts": NL.join(["import { sanitizeKey } from '@acme/shared';   // bare package import: which sanitizeKey?",
+                                "export function get(o: any, k: string) { return sanitizeKey(k) ? o[k] : undefined; }", ""]),
+    "app/uses_rel.ts": NL.join(["import { sanitizeKey } from '../a/safe';      // names its module: unambiguous",
+                                "export function get(o: any, k: string) { return sanitizeKey(k) ? o[k] : undefined; }", ""]),
+    # guard reached THROUGH an ordinary module that is not itself a guard
+    "svc/evaluator.ts": NL.join(["import { sanitizeKey } from '../a/safe';",
+                                 "export function evaluate(o: any, k: string) { return sanitizeKey(k) ? o[k] : undefined; }", ""]),
+    "svc/expression.ts": NL.join(["import { evaluate } from './evaluator';",
+                                  "export function run(o: any, k: string) { return evaluate(o, k); }", ""]),
+}
+with tempfile.TemporaryDirectory() as d:
+    for rel, body in AMBIG.items():
+        f = Path(d) / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(body, encoding="utf-8")
+    g2 = vcg.build(d)
+    check("an AMBIGUOUS guard name (defined in two modules, imported by bare package) links to NOTHING",
+          g2.subgraph("app/uses_pkg.ts") == {"file": "app/uses_pkg.ts", "guards": [], "blocklists": {}})
+    rel_sub = g2.subgraph("app/uses_rel.ts")
+    check("...while an import that names its module links to exactly that module's guard",
+          rel_sub["guards"] == ["a/safe#sanitizeKey"] and "blockedProps" in rel_sub["blocklists"])
+    via = g2.subgraph("svc/expression.ts")
+    check("a guard reached THROUGH an ordinary intermediate module is found (expression -> evaluator -> sanitizeKey)",
+          via["guards"] == ["a/safe#sanitizeKey"] and "blockedProps" in via["blocklists"])
+hinted = "BLOCKED_ATTRS: frozenset[str] = frozenset({" + NL + "    '__class__'," + NL + "    '__globals__'," + NL + "})" + NL
+with tempfile.TemporaryDirectory() as d:
+    (Path(d) / "g.py").write_text(hinted + NL + "def is_safe_attr(n):" + NL + "    return n not in BLOCKED_ATTRS" + NL, encoding="utf-8")
+    (Path(d) / "use.py").write_text("from g import is_safe_attr" + NL, encoding="utf-8")
+    check("type-hinted, multi-line Python blocklists with trailing commas are read",
+          sorted(vcg.build(d).subgraph("use.py")["blocklists"].get("BLOCKED_ATTRS", [])) == ["__class__", "__globals__"])
+cyc = {"x.ts": "import { b } from './y';" + NL + "export const a = 1;" + NL, "y.ts": "import { a } from './x';" + NL + "export const b = 2;" + NL}
+with tempfile.TemporaryDirectory() as d:
+    for rel, body in cyc.items():
+        (Path(d) / rel).write_text(body, encoding="utf-8")
+    check("import cycles terminate", vcg.build(d).subgraph("x.ts") == {"file": "x.ts", "guards": [], "blocklists": {}})
 check("missing workspace / unreadable input never raises and yields no graph",
       vcg.build("") is None and vcg.build("/definitely/not/a/real/path") is None)
 os.environ["CROSS_FILE"] = "off"

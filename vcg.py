@@ -7,7 +7,10 @@ blocks (e.g. a prototype-pollution finding on expression.ts when PrototypeSaniti
 -> unsafeObjectProperties in other files rejects `__proto__`/`constructor`). This module builds a small
 in-memory graph of the checked-out repo and returns, for a changed file, the guards it reaches through its
 imports and the blocklists those guards enforce. The gate uses that ONLY to suppress a finding it can prove
-is guarded — it never raises anything from this graph, so the worst a wrong edge can do is nothing.
+is guarded — nothing is ever RAISED from this graph. A wrong edge is therefore not harmless: it could
+suppress a REAL finding. So edges are only drawn when they are unambiguous — an import resolves to the
+module it names, or to a symbol name that is defined exactly ONCE in the repo; an ambiguous name links
+to nothing (a missed suppression costs a false positive; a wrong one would cost a missed vulnerability).
 
 Ported from PR #2 (2026-08-18) onto the current gate.py, with the properties a public Action needs:
   * bounded: caps on files, bytes per file and wall-clock; vendored/build dirs pruned; never raises
@@ -19,6 +22,7 @@ Edges     EDGE:<rel>:<src>  set of dst   (rel in IMPORTS, DEFINES, ENFORCES)
 """
 import json
 import os
+import posixpath
 import re
 import time
 from pathlib import Path
@@ -30,12 +34,13 @@ SKIP_DIRS = {"node_modules", ".git", "dist", "build", "vendor", ".venv", "venv",
 MAX_FILES = int(os.environ.get("VCG_MAX_FILES", "4000"))
 MAX_BYTES = int(os.environ.get("VCG_MAX_FILE_BYTES", "400000"))
 BUDGET_S = float(os.environ.get("VCG_BUDGET_SECONDS", "20"))
+MAX_WALK = 400                                  # files visited per subgraph walk
 
 GUARD_NAME_RX = re.compile(r"saniti[sz]|validat|escape|is_?safe|is_?allowed|blocklist|denylist", re.I)   # camelCase and snake_case
 BLOCK_RX = re.compile(r"(?:const|let|var)\s+(\w*(?:unsafe|blocked|forbidden|denied|reserved|blocklist|denylist)\w*)"
                       r"\s*=\s*new Set\(\[(.*?)\]\)", re.I | re.S)
 BLOCK_PY_RX = re.compile(r"^(\w*(?:UNSAFE|BLOCKED|FORBIDDEN|DENIED|RESERVED|BLOCKLIST|DENYLIST)\w*)"
-                         r"\s*=\s*(?:frozenset\(|set\()?[\[{(](.*?)[\]})]\)?\s*$", re.I | re.S | re.M)
+                         r"\s*(?::[^=\n]+)?=\s*(?:frozenset\(|set\()?[\[{(](.*?)[\]})]\)?\s*$", re.I | re.S | re.M)   # type hints, multi-line
 IMPORT_TS = re.compile(r"import\s+(?:type\s+)?\{([^}]*)\}\s+from\s+['\"]([^'\"]+)['\"]")
 IMPORT_PY = re.compile(r"^\s*from\s+([\w.]+)\s+import\s+\(?([^\n)]+)", re.M)
 DEF_TS = re.compile(r"export\s+(?:const|function|class|type|interface|abstract class)\s+(\w+)")
@@ -68,15 +73,21 @@ def _module_id(rel, imp, is_py):
             for _ in range(depth - 1):
                 base = base.parent
             tail = imp.lstrip(".").replace(".", "/")
-            return (base / tail).as_posix() if tail else base.as_posix()
+            return posixpath.normpath((base / tail).as_posix() if tail else base.as_posix())
         return imp.replace(".", "/")
-    return (Path(rel).parent / imp).as_posix() if imp.startswith(".") else imp
+    if not imp.startswith("."):
+        return imp
+    # Normalise '../' and './' — 'app/../a/safe' must equal the indexed id 'a/safe' or the edge is lost.
+    # Strip a written extension ('./util.js' in ESM TypeScript) the same way file ids are formed.
+    norm = posixpath.normpath(posixpath.join(posixpath.dirname(rel), imp))
+    return re.sub(r"\.(?:[mc]?[jt]sx?)$", "", norm)
 
 
 class VCG:
     def __init__(self, root):
         self.root = Path(root)
         self.ent, self.edges, self.defines = {}, {}, {}
+        self.definers = {}                     # symbol name -> set of file ids defining it (ambiguity check)
         self.files_indexed, self.truncated = 0, False
 
     def _edge(self, kind, src, dst):
@@ -107,6 +118,7 @@ class VCG:
                     self.ent[f"{fid}#{name}"] = {"type": "const", "path": rel, "name": name, "role": "blocklist", "value": vals}
                     self._edge("DEFINES", fid, f"{fid}#{name}")
                     self.defines[name] = fid
+                    self.definers.setdefault(name, set()).add(fid)
             for m in (DEF_PY if is_py else DEF_TS).finditer(txt):
                 name = m.group(1)
                 if f"{fid}#{name}" in self.ent:
@@ -115,6 +127,7 @@ class VCG:
                 self.ent[f"{fid}#{name}"] = {"type": "symbol", "path": rel, "name": name, "role": role}
                 self._edge("DEFINES", fid, f"{fid}#{name}")
                 self.defines.setdefault(name, fid)
+                self.definers.setdefault(name, set()).add(fid)
             for m in (IMPORT_PY if is_py else IMPORT_TS).finditer(txt):
                 mod, syms = (m.group(1), m.group(2)) if is_py else (m.group(2), m.group(1))
                 for sym in (x.strip().split(" as ")[0].strip() for x in syms.split(",")):
@@ -142,8 +155,20 @@ class VCG:
         for suffix in ("/index", "/__init__"):
             if f"{tgt}{suffix}#{sym}" in self.ent:
                 return f"{tgt}{suffix}#{sym}"
-        did = self.defines.get(sym)
-        return f"{did}#{sym}" if did else None
+        # Bare/package imports (or path forms we could not match): fall back to the symbol NAME only when
+        # exactly one file in the repo defines it. Two modules exporting `sanitize` must never be confused —
+        # linking to the wrong one could suppress a real finding.
+        owners = self.definers.get(sym) or ()
+        if len(owners) == 1:
+            return f"{next(iter(owners))}#{sym}"
+        return None
+
+    def _file_of(self, tgt):
+        """File id an import target names, if it is a first-party file we indexed (else None)."""
+        for cand in (tgt, tgt + "/index", tgt + "/__init__"):
+            if ("DEFINES", cand) in self.edges or ("IMPORTS", cand) in self.edges:
+                return cand
+        return None
 
     def subgraph(self, rel, max_depth=3):
         """Guards reachable from `rel` through its imports (transitively) and the blocklists they enforce."""
@@ -162,7 +187,12 @@ class VCG:
                         guards.add(eid)
                         for b in self.edges.get(("ENFORCES", eid), ()):
                             blocklists[self.ent[b]["name"]] = self.ent[b]["value"]
-                        nxt.append(eid.split("#")[0])
+                    # Keep walking through ORDINARY modules too: a guard is often reached via a plain
+                    # helper/service file (expression -> evaluator -> PrototypeSanitizer). Stopping at the
+                    # first non-guard import missed those chains. Bounded by max_depth and MAX_WALK.
+                    nxt_file = eid.split("#")[0] if eid else self._file_of(tgt)
+                    if nxt_file and nxt_file not in seen and len(seen) + len(nxt) < MAX_WALK:
+                        nxt.append(nxt_file)
             frontier = nxt
             if not frontier:
                 break
