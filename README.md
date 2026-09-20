@@ -95,6 +95,7 @@ All settings are optional.
 | `fail-on` | `reject` | `reject` = block the merge on a rejected change; `off` = comment only (watch mode). |
 | `max-files` | `25` | Most changed code files reviewed per pull request. If a PR changes more, the gate reviews the first `max-files`, flags the rest in the PR comment, and leaves them unreviewed — raise this for large PRs. |
 | `mcp-url` | `https://mcp.verificate.ai/mcp` | Point at your own Verificate deployment if your code must not leave your infrastructure. |
+| `cross-file` | `auto` | With the repo checked out, the gate is given cross-file guard context and drops findings that a guard in another file already blocks. `off` reviews each file alone. See below. |
 
 ```yaml
       - uses: VerificateAI/verificate-gate-action@v1
@@ -102,6 +103,23 @@ All settings are optional.
           verificate-api-key: ${{ secrets.VERIFICATE_API_KEY }}
           fail-on: reject
 ```
+
+## Cross-file context (fewer false positives)
+
+A reviewer that sees one file at a time will flag an "escape" that a guard in **another** file already blocks — for example a prototype-pollution finding on `expression.ts` when `PrototypeSanitizer` → `isSafeObjectProperty` → `unsafeObjectProperties` elsewhere rejects `__proto__` and `constructor`.
+
+If your workflow checks the repo out, the gate builds a small in-memory graph of it (imports → guards → the blocklists they enforce) and sends the relevant slice with each changed file, so it can **prove** a finding is guarded and drop it. The PR comment says how many files were indexed and how many findings were dropped.
+
+```yaml
+    steps:
+      - uses: actions/checkout@v4        # this is what enables cross-file context
+      - uses: VerificateAI/verificate-gate-action@v1
+```
+
+- **Suppress-only.** Nothing is ever *raised* from the graph; a wrong edge can at worst change nothing.
+- **Bounded.** At most 4,000 files, 400 KB per file and 20 seconds; `node_modules`, build output and virtualenvs are skipped. It never fails your check.
+- **Nothing extra leaves the runner** beyond guard and blocklist *names/values* for the file under review.
+- Without `actions/checkout` the Action works exactly as before. Set `cross-file: off` to disable.
 
 ## Outputs
 
