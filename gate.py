@@ -128,7 +128,24 @@ def set_output(**kv):
         for k, v in kv.items():
             f.write(f"{k}={str(v).replace(chr(10), ' ')}\n")
 
-def mcp_validate(code, lang, rebuttal=""):
+CROSS_FILE = os.environ.get("CROSS_FILE", "auto").strip().lower()      # auto | off
+
+
+def build_context_graph():
+    """Cross-file guard graph of the checked-out repo, or None. The Action reads changed files through
+    the GitHub API and does not need actions/checkout — so this is available exactly when the caller's
+    workflow checked the repo out, and silently absent otherwise. Never raises."""
+    if CROSS_FILE == "off":
+        return None
+    try:
+        import vcg
+        return vcg.build(os.environ.get("GITHUB_WORKSPACE", ""))
+    except Exception as e:
+        print(f"::warning::cross-file context skipped: {type(e).__name__}: {str(e)[:120]}")
+        return None
+
+
+def mcp_validate(code, lang, rebuttal="", rel=None, graph=None):
     # A rebuttal (from .verificate/rebuttals.md) lets the gate adjudicate a prior finding the
     # agent contests with proof — the gate overturns findings whose methodology it accepts.
     ctx = {"language": lang}
@@ -140,6 +157,16 @@ def mcp_validate(code, lang, rebuttal=""):
         ctx["security_graph"] = {"injection_reachable": _t["injection_reachable"], "taint_flows": _t["flows"]}
     except Exception:
         pass
+    # Cross-file GUARD context: the guards this file reaches through its imports and the blocklists they
+    # enforce, so the gate can drop a finding it can PROVE is blocked in another file. Suppress-only —
+    # nothing is ever raised from the graph, so a wrong edge can at worst change nothing.
+    if graph is not None and rel:
+        try:
+            sub = graph.subgraph(rel)
+            if sub["guards"] or sub["blocklists"]:
+                ctx.setdefault("security_graph", {}).update({"guards": sub["guards"], "blocklists": sub["blocklists"]})
+        except Exception:
+            pass
     if rebuttal:
         ctx["rebuttal"] = rebuttal[:6000]
     def rpc(method, params, rid):
@@ -237,12 +264,17 @@ def main():
         pass  # no rebuttals file is the normal case
 
     rows, vetoed_any, rejected_any, errors, capped, fixes = [], False, False, 0, False, []
+    vcg_metas = []
+    graph = build_context_graph()
+    if graph is not None:
+        print(f"Cross-file context: {graph.files_indexed} files indexed"
+              + (" (time budget reached — partial graph)" if graph.truncated else ""))
     for f in targets:
         ext = "." + f["filename"].rsplit(".",1)[-1]
         try:
             meta = gh(f"/repos/{REPO}/contents/{urllib.parse.quote(f['filename'])}{ref_qs}")
             code = base64.b64decode(meta["content"]).decode("utf-8","replace")
-            res = mcp_validate(code, LANG.get(ext, "text"), rebuttal=rebuttal)
+            res = mcp_validate(code, LANG.get(ext, "text"), rebuttal=rebuttal, rel=f["filename"], graph=graph)
         except Exception as e:
             errors += 1
             print(f"::warning::Verificate gate error on {f['filename']}: {type(e).__name__}: {str(e)[:160]}")
@@ -262,6 +294,7 @@ def main():
             print(f"::warning::Verificate gate unavailable for {f['filename']} — free-tier limit reached. "
                   f"Add a VERIFICATE_API_KEY secret (free, no card: https://verificate.ai/auth/signup) to get your own quota.")
             rows.append((f["filename"], "⚠️ skipped — free limit reached", "")); continue
+        vcg_metas.append(res)
         prot = res.get("protection", {})
         vetoed = bool(prot.get("vetoed"))
         rejected = vetoed or res.get("valid") is False or str(res.get("assessment",{}).get("verdict","")).lower() in ("reject","rejected")
@@ -287,6 +320,10 @@ def main():
              f"Reviewed **{len(targets)}** changed code file(s)"
              + (f" · {errors} skipped (gate error)" if errors else "") + ".", "",
              "| File | Verdict | Detail |", "|---|---|---|"]
+    if graph is not None:
+        n_sup = sum(int(((r_ or {}).get("vcg") or {}).get("suppressed", 0) or 0) for r_ in vcg_metas)
+        lines.insert(3, f"Cross-file context: {graph.files_indexed} files indexed"
+                     + (f" · {n_sup} finding(s) dropped as proven-guarded in another file" if n_sup else "") + ".")
     for name, status, detail in rows:
         lines.append(f"| {cell(name)} | {status} | {cell(detail)} |")
     # Per-file remediation — the actionable "how to fix", collapsed so the comment stays tidy.

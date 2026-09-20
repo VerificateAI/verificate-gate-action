@@ -18,6 +18,10 @@ inputs:
     description: "Verificate MCP endpoint."
     required: false
     default: "https://mcp.verificate.ai/mcp"
+  cross-file:
+    description: "'auto' = when the repo is checked out, give the gate cross-file guard context so it drops findings a guard in another file already blocks; 'off' = review each file alone."
+    required: false
+    default: "auto"
 outputs:
   verdict:
     description: "Overall gate verdict: 'approved', 'rejected', 'vetoed', or 'error' (gate failures never block merges)."
@@ -45,3 +49,4 @@ runs:
         VERIFICATE_MCP_URL: ${{ inputs.mcp-url }}
         FAIL_ON: ${{ inputs.fail-on }}
         MAX_FILES: ${{ inputs.max-files }}
+        CROSS_FILE: ${{ inputs.cross-file }}
