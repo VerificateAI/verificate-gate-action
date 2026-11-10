@@ -2,11 +2,17 @@
 
 Runs the Verificate merge gate on the changed code files of a pull request, posts an inline
 summary comment, and exits non-zero if the gate VETOES (so it can be a required status check
-that blocks merge). Design principle: fail CLOSED only on a real veto; fail OPEN on any
-infrastructure error (MCP unreachable, timeouts) so gate outages never block your merges.
+that blocks merge). Modes (FAIL_ON):
+  reject (default) - fail CLOSED only on a real veto or rejection; fail OPEN on any infrastructure
+                     error (MCP unreachable, timeouts, quota) so gate outages never block merges.
+  off              - comment only, never fail the check.
+  strict           - fail CLOSED unless every changed file was reviewed and approved: gate errors,
+                     skipped reviews, files over max-files, an incomplete file list and unexpected
+                     exceptions all fail the check. Files with an unrecognised extension are
+                     reviewed, never silently skipped. For required checks that must not fail open.
 
 Env: GITHUB_TOKEN, GITHUB_REPOSITORY, GITHUB_EVENT_PATH, optional VERIFICATE_MCP_URL,
-VERIFICATE_API_KEY, FAIL_ON (reject|off), MAX_FILES.
+VERIFICATE_API_KEY, FAIL_ON (reject|off|strict), MAX_FILES.
 """
 from __future__ import annotations
 import base64, html, json, os, random, ssl, sys, time, urllib.parse, urllib.request, urllib.error
@@ -36,7 +42,12 @@ OIDC_REQ_URL = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL", "")
 OIDC_REQ_TOKEN = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "")
 MCP_URL = os.environ.get("VERIFICATE_MCP_URL", "https://mcp.verificate.ai/mcp")
 VKEY = os.environ.get("VERIFICATE_API_KEY", "").strip()
-FAIL_ON = os.environ.get("FAIL_ON", "reject").strip().lower()
+FAIL_MODES = ("reject", "off", "strict")
+FAIL_ON = os.environ.get("FAIL_ON", "reject").strip().lower() or "reject"
+if FAIL_ON not in FAIL_MODES:
+    # A typo must never silently turn a blocking check into a comment-only one.
+    print(f"::warning::fail-on '{FAIL_ON}' is not one of {', '.join(FAIL_MODES)}; using 'reject'.")
+    FAIL_ON = "reject"
 try:
     MAX_FILES = int(os.environ.get("MAX_FILES", "25"))
 except ValueError:
@@ -45,10 +56,64 @@ except ValueError:
 MAX_FILES = max(1, min(MAX_FILES, 300))
 MARK = "<!-- verificate-gate -->"
 CODE_EXT = {".py",".js",".ts",".tsx",".jsx",".go",".java",".rb",".rs",".c",".cc",".cpp",
-            ".cs",".php",".sql",".sh",".kt",".swift",".scala"}
+            ".cs",".php",".sql",".sh",".kt",".swift",".scala",
+            ".h",".hh",".hpp",".cxx",".css",".html",".htm",".mjs",".cjs",".ps1",".psql"}
+# Strict mode reviews every changed file EXCEPT these: prose and binary assets that carry no
+# executable behaviour. Everything else, including an unknown or missing extension, is code.
+NON_CODE_EXT = {".md",".markdown",".rst",".txt",".png",".jpg",".jpeg",".gif",".webp",".ico",
+                ".bmp",".pdf",".woff",".woff2",".ttf",".otf",".eot",".mp4",".mov",".mp3",".wav",
+                ".zip",".gz",".tgz"}
 LANG = {".py":"python",".js":"javascript",".ts":"typescript",".tsx":"typescript",".jsx":"javascript",
-        ".go":"go",".java":"java",".rb":"ruby",".rs":"rust",".cpp":"cpp",".cs":"csharp",".php":"php",".sql":"sql"}
+        ".mjs":"javascript",".cjs":"javascript",".go":"go",".java":"java",".rb":"ruby",".rs":"rust",
+        ".c":"c",".h":"cpp",".hh":"cpp",".hpp":"cpp",".cc":"cpp",".cxx":"cpp",".cpp":"cpp",
+        ".cs":"csharp",".php":"php",".sql":"sql",".psql":"sql",".sh":"bash",".ps1":"powershell",
+        ".css":"css",".html":"html",".htm":"html"}
+# The GitHub "list pull request files" API returns at most 3000 files; at that size the list
+# may be incomplete, so strict mode treats it as unreviewed.
+GH_FILES_LIMIT = 3000
+# File statuses whose head content is reviewed. "removed" has nothing to read.
+REVIEW_STATUS = {"added", "modified"}
+STRICT_REVIEW_STATUS = {"added", "modified", "renamed", "copied", "changed"}
 _ctx = ssl.create_default_context()
+
+
+def file_ext(filename):
+    """Lower-cased extension of the file's base name ('' if none). The previous
+    '"." + rsplit(".")' turned 'Makefile' into '.Makefile' and 'a.b/c' into '.b/c'."""
+    return os.path.splitext(filename.rsplit("/", 1)[-1])[1].lower()
+
+
+def is_code(filename, mode):
+    """Whether a changed file must be reviewed. reject/off keep the published allow-list;
+    strict reviews everything that is not explicitly prose or a binary asset."""
+    ext = file_ext(filename)
+    if mode == "strict":
+        return ext not in NON_CODE_EXT
+    return ext in CODE_EXT
+
+
+def to_review(files, mode):
+    statuses = STRICT_REVIEW_STATUS if mode == "strict" else REVIEW_STATUS
+    return [f for f in files if f.get("status") in statuses and is_code(f.get("filename", ""), mode)]
+
+
+def exit_code(mode, vetoed, rejected, errors, dropped, incomplete_list=False):
+    """The one place the check's pass/fail is decided."""
+    if mode == "off":
+        return 0
+    if vetoed or rejected:
+        return 1
+    if mode == "strict" and (errors or dropped or incomplete_list):
+        return 1
+    return 0
+
+
+def read_file(meta):
+    """Decode a contents-API object. Files over 1 MB come back with encoding 'none' and no
+    content; reviewing that as an empty file would be a false approval, so it is an error."""
+    if not isinstance(meta, dict) or meta.get("encoding") != "base64" or "content" not in meta:
+        raise ValueError("file content not available from the contents API (too large or not a file)")
+    return base64.b64decode(meta["content"]).decode("utf-8", "replace")
 
 def github_oidc_token():
     """Fetch a GitHub Actions OIDC JWT (audience=verificate-gate) so the gate's free tier
@@ -138,8 +203,9 @@ def mcp_validate(code, lang, rebuttal=""):
         import taint
         _t = taint.analyze(code)
         ctx["security_graph"] = {"injection_reachable": _t["injection_reachable"], "taint_flows": _t["flows"]}
-    except Exception:
-        pass
+    except Exception as e:
+        # Optional hint only: the review still runs, just without the reachability graph.
+        print(f"::warning::taint analysis skipped ({type(e).__name__}); reviewing without the reachability hint.")
     if rebuttal:
         ctx["rebuttal"] = rebuttal[:6000]
     def rpc(method, params, rid):
@@ -210,12 +276,21 @@ def main():
     ref_qs = f"?ref={head}" if head else ""
     if not pr:
         print("Not a pull_request event; nothing to gate."); return 0
+    mode = FAIL_ON
     try:
         files = gh_all(f"/repos/{REPO}/pulls/{pr}/files")
+        if not isinstance(files, list):
+            raise ValueError("pull request file list is not a list")
     except Exception as e:
+        if mode == "strict":
+            print(f"::error::could not list files ({type(e).__name__}); strict mode blocks the merge.")
+            set_output(verdict="error", files_reviewed=0, files_errored=0, files_dropped=0)
+            return 1
         print(f"::warning::could not list files ({e}); failing open."); return 0
-    eligible = [f for f in files if f.get("status") in ("added","modified")
-                and any(f["filename"].endswith(e) for e in CODE_EXT)]
+    incomplete_list = len(files) >= GH_FILES_LIMIT
+    if incomplete_list:
+        print(f"::warning::the pull request lists {len(files)} files, GitHub's maximum; the list may be incomplete.")
+    eligible = to_review(files, mode)
     targets = eligible[:MAX_FILES]
     dropped = len(eligible) - len(targets)
     if dropped:
@@ -223,7 +298,8 @@ def main():
               f"{dropped} were left unreviewed. Raise max-files to cover the whole PR.")
     if not targets:
         upsert_comment(pr, f"{MARK}\n### ✅ Verificate Gate — no code changes to review.")
-        print("No code files changed."); return 0
+        print("No code files changed.")
+        return exit_code(mode, False, False, 0, 0, incomplete_list)
 
     # Appeal channel: if the author (or their agent) contested prior findings with a proof in
     # .verificate/rebuttals.md, feed it to the gate so it can adjudicate and overturn sound rebuttals.
@@ -238,10 +314,10 @@ def main():
 
     rows, vetoed_any, rejected_any, errors, capped, fixes = [], False, False, 0, False, []
     for f in targets:
-        ext = "." + f["filename"].rsplit(".",1)[-1]
+        ext = file_ext(f["filename"])
         try:
             meta = gh(f"/repos/{REPO}/contents/{urllib.parse.quote(f['filename'])}{ref_qs}")
-            code = base64.b64decode(meta["content"]).decode("utf-8","replace")
+            code = read_file(meta)
             res = mcp_validate(code, LANG.get(ext, "text"), rebuttal=rebuttal)
         except Exception as e:
             errors += 1
@@ -271,6 +347,11 @@ def main():
         if rejected: rejected_any = True
         status = "❌ REJECTED" if rejected else "✅ approved"
         detail = ("vetoed by " + ", ".join(prot.get("vetoed_by") or [])) if vetoed else (f"score {score}" if score is not None else "")
+        if mode == "strict" and not rejected and res.get("valid") is not True:
+            # Strict requires a positive approval; a response with no verdict is not one.
+            errors += 1
+            rows.append((f["filename"], "⚠️ no verdict returned", detail))
+            continue
         rows.append((f["filename"], status, detail))
         for iss in issues[:4]:
             rows.append(("　↳", cell(iss), ""))
@@ -364,9 +445,13 @@ def main():
                   "The check stays red until every reviewed file passes."]
     else:
         lines += ["", "No blocking findings. " + ("Warnings noted above." if errors else "Changes cleared the gate.")]
+    if mode == "strict" and (errors or dropped or incomplete_list):
+        lines += ["", "**Strict mode: not every changed file was reviewed and approved, so the check is red.** "
+                  "Re-run the check once the gate is reachable, or split the PR so it is within `max-files`."]
     if capped:
         lines += ["", "> ⚠️ **Some files were skipped — the shared free trial on this runner is used up, so the gate couldn't score them.** "
-                  "The gate failed **open**, so this did **not** block your merge. "
+                  + ("Strict mode blocks the merge until they are reviewed. " if mode == "strict" else
+                     "The gate failed **open**, so this did **not** block your merge. ") +
                   "To get your own quota (free, no card, 30 days), sign up at "
                   "[verificate.ai/auth/signup](https://verificate.ai/auth/signup) and add the key as a repo secret named "
                   "**`VERIFICATE_API_KEY`** — validations resume on the next push."]
@@ -383,17 +468,29 @@ def main():
         files_dropped=dropped,
     )
 
-    if (vetoed_any or rejected_any) and FAIL_ON == "reject":
+    rc = exit_code(mode, vetoed_any, rejected_any, errors, dropped, incomplete_list)
+    if rc and (vetoed_any or rejected_any):
         why = "VETOED by a deterministic reality gate" if vetoed_any else "REJECTED"
         print(f"::error::Verificate Gate: a change was {why} — blocking merge until fixed.")
-        return 1
-    print("Verificate Gate: passed.")
-    return 0
+    elif rc:
+        print(f"::error::Verificate Gate (strict): {errors} file(s) not reviewed, {dropped} over max-files"
+              + (", file list may be incomplete" if incomplete_list else "") + " — blocking merge.")
+    else:
+        print("Verificate Gate: passed.")
+    return rc
+
+
+def entry():
+    """Process entry point. reject/off fail open on an unexpected error; strict fails closed."""
+    try:
+        return main()
+    except Exception as e:
+        if FAIL_ON == "strict":
+            print(f"::error::Verificate Gate errored ({type(e).__name__}); strict mode blocks the merge.")
+            return 1
+        print(f"::warning::Verificate Gate errored, failing open: {e}")
+        return 0
+
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except Exception as e:
-        # Global fail-open: never block a merge on an unexpected gate error.
-        print(f"::warning::Verificate Gate errored, failing open: {e}")
-        sys.exit(0)
+    sys.exit(entry())
