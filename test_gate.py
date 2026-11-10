@@ -47,9 +47,11 @@ os.environ.pop("GITHUB_OUTPUT", None)
 
 
 posted = []
+mcp_kwargs = []
 
 
-def run(mode, files, verdicts, *, list_error=None, crash=False, max_files=25, via_entry=False, spy=None):
+def run(mode, files, verdicts, *, list_error=None, crash=False, max_files=25, via_entry=False, spy=None,
+        live_head=None):
     """Run the gate once. verdicts maps filename -> verdict dict, or an Exception to raise."""
     gate.FAIL_ON, gate.MAX_FILES = mode, max_files
     reviewed = []
@@ -64,17 +66,23 @@ def run(mode, files, verdicts, *, list_error=None, crash=False, max_files=25, vi
             spy.append(path)
         if "/contents/.verificate/" in path:
             raise RuntimeError("no rebuttals")
+        if path.rstrip("/").split("/")[-2:-1] == ["pulls"]:  # GET /repos/o/r/pulls/{n}
+            with open(_event.name, encoding="utf-8") as fh:
+                ev_head = ((json.load(fh).get("pull_request") or {}).get("head") or {}).get("sha")
+            return {"head": {"sha": ev_head if live_head is None else live_head}}
         return {"encoding": "base64", "content": base64.b64encode(b"x = 1\n").decode()}
 
-    def mcp(code, lang, rebuttal=""):
+    def mcp(code, lang, rebuttal="", **kw):
         name = reviewed_names[len(reviewed)]
         reviewed.append(name)
+        mcp_kwargs.append(kw)
         v = verdicts.get(name, approved)
         if isinstance(v, Exception):
             raise v
         return gate._not_a_verdict(v) or v
 
-    reviewed_names = [f["filename"] for f in gate.to_review(files, mode)]
+    reviewed_names = [f["filename"] for f in gate.to_review(files, mode)
+                      if not (mode == "strict" and gate.file_ext(f["filename"]) in gate.BINARY_EXEC_EXT)]
     def comment(pr, body):
         posted.append(body)
         if crash:  # raised outside every per-file handler, so only the global handler sees it
@@ -171,7 +179,7 @@ check("parse_fail_on: ' Strict ' is strict", gate.parse_fail_on(" Strict ") == (
 check("parse_max_files: 500 clamps to 300 with a warning", gate.parse_max_files("500")[0] == 300 and gate.parse_max_files("500")[1])
 check("parse_max_files: junk falls back to 25 with a warning", gate.parse_max_files("lots")[0] == 25 and gate.parse_max_files("lots")[1])
 check("parse_max_files: 40 is accepted silently", gate.parse_max_files("40") == (40, ""))
-check("importing gate made no OIDC request", gate._OIDC_CACHE == [])
+check("importing gate made no OIDC request", gate.net._OIDC_CACHE == [])
 
 
 # revision 3: non-PR events, rebuttal source, malformed responses, cell, Retry-After
@@ -220,15 +228,15 @@ def _urlopen_date(req, timeout):
     return "ok"
 
 
-gate._urlopen, _sleep = _urlopen_date, gate.time.sleep
-gate.time.sleep = lambda s: None
+gate.net._urlopen, _sleep = _urlopen_date, gate.net.time.sleep
+gate.net.time.sleep = lambda s: None
 try:
-    out = gate._open(object(), 5, tries=2)
+    out = gate.net._open(object(), 5, tries=2)
     check("an HTTP-date Retry-After waits and retries instead of crashing", out == "ok" and len(calls) == 2)
 except ValueError:
     check("an HTTP-date Retry-After waits and retries instead of crashing", False)
 finally:
-    gate.time.sleep = _sleep
+    gate.net.time.sleep = _sleep
 
 # revision 4: response shapes, labelling, taint loading, Retry-After range, MCP body shape
 rc, reviewed = run("strict", two, {"bad.py": {"valid": True, "issues": "not a list", "protection": {"vetoed": False, "vetoed_by": [1]}}})
@@ -246,7 +254,7 @@ check("an untyped unavailable response is not labelled as quota exhaustion",
 
 sys.modules["taint"] = type(sys)("taint")  # a planted module must never be the one used
 check("taint is loaded from the action's own file, not a module named 'taint' on sys.path",
-      os.path.abspath(gate._load_taint().__file__) == os.path.join(os.path.dirname(os.path.abspath(gate.__file__)), "taint.py"))
+      os.path.abspath(gate.net._load_taint().__file__) == os.path.join(os.path.dirname(os.path.abspath(gate.__file__)), "taint.py"))
 del sys.modules["taint"]
 
 calls.clear()
@@ -260,14 +268,14 @@ def _urlopen_neg(req, timeout):
 
 
 slept = []
-gate._urlopen, gate.time.sleep = _urlopen_neg, lambda s: slept.append(s)
+gate.net._urlopen, gate.net.time.sleep = _urlopen_neg, lambda s: slept.append(s)
 try:
-    out = gate._open(object(), 5, tries=2)
+    out = gate.net._open(object(), 5, tries=2)
     check("a negative Retry-After backs off a sane positive time and retries", out == "ok" and slept and slept[0] >= 30)
 except ValueError:
     check("a negative Retry-After backs off a sane positive time and retries", False)
 finally:
-    gate.time.sleep = _sleep
+    gate.net.time.sleep = _sleep
 
 
 class _Resp:
@@ -278,7 +286,7 @@ class _Resp:
 
 
 import importlib  # noqa: E402
-g2 = importlib.reload(gate)
+g2 = importlib.reload(gate.net)
 g2._OIDC_CACHE.append("")
 g2._open = lambda req, timeout, tries=3, label="": _Resp(b'{"jsonrpc":"2.0","id":2,"result":null}')
 check("mcp_validate: a null JSON-RPC result is 'unavailable', never an AttributeError", g2.mcp_validate("x=1", "python").get("_unavailable") is True)
@@ -288,6 +296,39 @@ try:
     check("mcp_validate: an oversized response is refused", False)
 except ValueError:
     check("mcp_validate: an oversized response is refused", True)
+
+# revision 5: agent instructions, head pinning, reachability hint
+sent = []
+g2._open = lambda req, timeout, tries=3, label="": (sent.append(json.loads(req.data)), _Resp(b'{"result":null}'))[1]
+g2.mcp_validate("os.system(x)", "python", reachability_hint=False)
+call = [s for s in sent if s.get("method") == "tools/call"][-1]["params"]["arguments"]
+check("mcp_validate: reachability_hint=False sends no security_graph", "security_graph" not in call["context"])
+g2.mcp_validate("# guide", "text", validation_type="documentation")
+call = [s for s in sent if s.get("method") == "tools/call"][-1]["params"]["arguments"]
+check("mcp_validate: validation_type is forwarded", call["validation_type"] == "documentation")
+
+for name in ("AGENTS.md", "docs/CLAUDE.md", ".github/copilot-instructions.md", ".cursorrules",
+             ".claude/commands/deploy.md", ".github/instructions/py.instructions.md", ".verificate/rebuttals.md"):
+    check(f"strict: agent instructions {name} are reviewed", gate.is_code(name, "strict"))
+check("agent-instruction Markdown is reviewed as documentation", gate.review_type("AGENTS.md") == "documentation")
+check("ordinary Markdown is still exempt in strict", not gate.is_code("docs/guide.md", "strict"))
+check("code under .claude/ is reviewed as code", gate.review_type(".claude/hooks/pre.py") == "code_generation")
+
+set_event({"pull_request": {"number": 7, "head": {"sha": "HEADSHA"}, "base": {"sha": "BASESHA"}}})
+rc, reviewed = run("strict", one, {}, live_head="NEWERSHA")
+check("strict: a PR head that moved since the event blocks without reviewing", rc == 1 and reviewed == [])
+rc, _ = run("strict", one, {})
+check("strict: a matching head passes", rc == 0)
+rc, _ = run("reject", one, {}, live_head="NEWERSHA")
+check("reject: head pinning is strict-only (unchanged)", rc == 0)
+mcp_kwargs.clear()
+run("strict", [{"filename": "AGENTS.md", "status": "modified"}, {"filename": "a.py", "status": "modified"}], {})
+check("strict: main sends no reachability hint and types agent docs as documentation",
+      [k.get("reachability_hint") for k in mcp_kwargs] == [False, False]
+      and [k.get("validation_type") for k in mcp_kwargs] == ["documentation", "code_generation"])
+mcp_kwargs.clear()
+run("reject", one, {})
+check("reject: main keeps the reachability hint (unchanged)", [k.get("reachability_hint") for k in mcp_kwargs] == [True])
 os.unlink(_event.name)
 
 print("\nGATE ACTION CONTRACT: " + ("FAILED %d" % len(fails) if fails else "PASSED"))
