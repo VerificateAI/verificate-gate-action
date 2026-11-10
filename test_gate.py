@@ -206,10 +206,10 @@ def run_capturing(mode):
 
 seen.clear(); run_capturing("strict")
 rb = [p for p in seen if "rebuttals.md" in p]
-check("strict: rebuttals are read from the base commit, never the PR head", rb == ["/repos/example/repo/contents/.verificate/rebuttals.md?ref=BASESHA"])
+check("strict: rebuttals are read from the base commit, never the PR head", rb == [f"/repos/{gate.REPO}/contents/.verificate/rebuttals.md?ref=BASESHA"])
 check("strict: the reviewed code is still read from the PR head", any(p.endswith("a.py?ref=HEADSHA") for p in seen))
 seen.clear(); run_capturing("reject")
-check("reject: rebuttals still come from the PR head (unchanged)", [p for p in seen if "rebuttals.md" in p] == ["/repos/example/repo/contents/.verificate/rebuttals.md?ref=HEADSHA"])
+check("reject: rebuttals still come from the PR head (unchanged)", [p for p in seen if "rebuttals.md" in p] == [f"/repos/{gate.REPO}/contents/.verificate/rebuttals.md?ref=HEADSHA"])
 
 two = [{"filename": "bad.py", "status": "modified"}, {"filename": "good.py", "status": "modified"}]
 rc, reviewed = run("strict", two, {"bad.py": {"valid": True, "protection": "oops"}})
