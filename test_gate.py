@@ -141,6 +141,30 @@ rc, _ = run("reject", one, {"a.py": veto})
 check("reject: a veto fails the check", rc == 1)
 rc, _ = run("off", one, {"a.py": veto})
 check("off: a veto only comments", rc == 0)
+# revision 2: encoding, binaries, config parsing
+b64 = lambda raw: {"encoding": "base64", "content": base64.b64encode(raw).decode()}
+utf16 = "SELECT 1;".encode("utf-16")
+try:
+    gate.read_file(b64(utf16), "strict")
+    check("strict: a UTF-16 file is unreviewable, never reviewed as replacement characters", False)
+except ValueError:
+    check("strict: a UTF-16 file is unreviewable, never reviewed as replacement characters", True)
+try:
+    gate.read_file(b64(b"\x7fELF\x00\x01"), "strict")
+    check("strict: NUL-containing content is unreviewable", False)
+except ValueError:
+    check("strict: NUL-containing content is unreviewable", True)
+check("strict: a UTF-8 BOM is accepted", gate.read_file(b64(b"\xef\xbb\xbfx = 1\n"), "strict") == "x = 1\n")
+check("reject: decoding stays lenient (unchanged)", "�" in gate.read_file(b64(b"\xff\xfe"), "reject"))
+rc, reviewed = run("strict", [{"filename": "lib/native.so", "status": "added"}], {})
+check("strict: a compiled binary blocks without being sent for review", rc == 1 and reviewed == [])
+check("strict: compressed archives are not code", not gate.is_code("x.tar", "strict") and not gate.is_code("y.7z", "strict"))
+check("parse_fail_on: typo falls back to reject with a warning", gate.parse_fail_on("strct")[0] == "reject" and gate.parse_fail_on("strct")[1])
+check("parse_fail_on: ' Strict ' is strict", gate.parse_fail_on(" Strict ") == ("strict", ""))
+check("parse_max_files: 500 clamps to 300 with a warning", gate.parse_max_files("500")[0] == 300 and gate.parse_max_files("500")[1])
+check("parse_max_files: junk falls back to 25 with a warning", gate.parse_max_files("lots")[0] == 25 and gate.parse_max_files("lots")[1])
+check("parse_max_files: 40 is accepted silently", gate.parse_max_files("40") == (40, ""))
+check("importing gate made no OIDC request", gate._OIDC_CACHE == [])
 os.unlink(_event.name)
 
 print("\nGATE ACTION CONTRACT: " + ("FAILED %d" % len(fails) if fails else "PASSED"))

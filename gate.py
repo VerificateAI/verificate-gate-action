@@ -43,17 +43,32 @@ OIDC_REQ_TOKEN = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "")
 MCP_URL = os.environ.get("VERIFICATE_MCP_URL", "https://mcp.verificate.ai/mcp")
 VKEY = os.environ.get("VERIFICATE_API_KEY", "").strip()
 FAIL_MODES = ("reject", "off", "strict")
-FAIL_ON = os.environ.get("FAIL_ON", "reject").strip().lower() or "reject"
-if FAIL_ON not in FAIL_MODES:
-    # A typo must never silently turn a blocking check into a comment-only one.
-    print(f"::warning::fail-on '{FAIL_ON}' is not one of {', '.join(FAIL_MODES)}; using 'reject'.")
-    FAIL_ON = "reject"
-try:
-    MAX_FILES = int(os.environ.get("MAX_FILES", "25"))
-except ValueError:
-    print(f"::warning::max-files '{os.environ.get('MAX_FILES')}' is not an integer; using 25.")
-    MAX_FILES = 25
-MAX_FILES = max(1, min(MAX_FILES, 300))
+
+
+def parse_fail_on(raw):
+    """(mode, warning or ''). A typo must never silently turn a blocking check into a
+    comment-only one, so an unrecognised value falls back to 'reject'."""
+    mode = (raw or "").strip().lower() or "reject"
+    if mode not in FAIL_MODES:
+        return "reject", f"fail-on '{mode}' is not one of {', '.join(FAIL_MODES)}; using 'reject'."
+    return mode, ""
+
+
+def parse_max_files(raw):
+    """(n, warning or ''), n clamped to 1..300; a clamp or a bad value is reported, never silent."""
+    try:
+        n = int(raw if raw not in (None, "") else "25")
+    except ValueError:
+        return 25, f"max-files '{raw}' is not an integer; using 25."
+    if n < 1 or n > 300:
+        c = max(1, min(n, 300))
+        return c, f"max-files {n} is outside 1-300; using {c}."
+    return n, ""
+
+
+# Pure parsing at import; the warnings are printed by main(), not as an import side effect.
+FAIL_ON, _FAIL_ON_WARNING = parse_fail_on(os.environ.get("FAIL_ON", "reject"))
+MAX_FILES, _MAX_FILES_WARNING = parse_max_files(os.environ.get("MAX_FILES", "25"))
 MARK = "<!-- verificate-gate -->"
 CODE_EXT = {".py",".js",".ts",".tsx",".jsx",".go",".java",".rb",".rs",".c",".cc",".cpp",
             ".cs",".php",".sql",".sh",".kt",".swift",".scala",
@@ -62,7 +77,11 @@ CODE_EXT = {".py",".js",".ts",".tsx",".jsx",".go",".java",".rb",".rs",".c",".cc"
 # executable behaviour. Everything else, including an unknown or missing extension, is code.
 NON_CODE_EXT = {".md",".markdown",".rst",".txt",".png",".jpg",".jpeg",".gif",".webp",".ico",
                 ".bmp",".pdf",".woff",".woff2",".ttf",".otf",".eot",".mp4",".mov",".mp3",".wav",
-                ".zip",".gz",".tgz"}
+                ".zip",".gz",".tgz",".7z",".xz",".bz2",".tar"}
+# Compiled or executable binaries cannot be reviewed as text. Strict mode does not skip them
+# (that would pass executable bytes nobody read); it reports them as unreviewable and blocks.
+BINARY_EXEC_EXT = {".pyc",".pyo",".so",".dll",".dylib",".exe",".jar",".class",".bin",".o",
+                   ".a",".lib",".wasm",".whl",".node"}
 LANG = {".py":"python",".js":"javascript",".ts":"typescript",".tsx":"typescript",".jsx":"javascript",
         ".mjs":"javascript",".cjs":"javascript",".go":"go",".java":"java",".rb":"ruby",".rs":"rust",
         ".c":"c",".h":"cpp",".hh":"cpp",".hpp":"cpp",".cc":"cpp",".cxx":"cpp",".cpp":"cpp",
@@ -108,12 +127,29 @@ def exit_code(mode, vetoed, rejected, errors, dropped, incomplete_list=False):
     return 0
 
 
-def read_file(meta):
+def read_file(meta, mode="reject"):
     """Decode a contents-API object. Files over 1 MB come back with encoding 'none' and no
-    content; reviewing that as an empty file would be a false approval, so it is an error."""
+    content; reviewing that as an empty file would be a false approval, so it is an error.
+    In strict mode the bytes must be valid UTF-8 (a BOM is allowed): a UTF-16 or binary file
+    decoded with 'replace' would be reviewed as replacement characters, not as the committed
+    code, so it raises instead and the file counts as unreviewed."""
     if not isinstance(meta, dict) or meta.get("encoding") != "base64" or "content" not in meta:
         raise ValueError("file content not available from the contents API (too large or not a file)")
-    return base64.b64decode(meta["content"]).decode("utf-8", "replace")
+    raw = base64.b64decode(meta["content"])
+    if mode == "strict":
+        if b"\x00" in raw:
+            raise ValueError("binary content cannot be reviewed as text")
+        return raw.decode("utf-8-sig")  # UnicodeDecodeError is a ValueError
+    return raw.decode("utf-8", "replace")
+
+_OIDC_CACHE = []
+
+
+def oidc_token():
+    """The OIDC token, fetched once on first use (never at import)."""
+    if not _OIDC_CACHE:
+        _OIDC_CACHE.append(github_oidc_token())
+    return _OIDC_CACHE[0]
 
 def github_oidc_token():
     """Fetch a GitHub Actions OIDC JWT (audience=verificate-gate) so the gate's free tier
@@ -129,8 +165,6 @@ def github_oidc_token():
     except Exception as e:
         print(f"::warning::could not obtain OIDC token ({type(e).__name__}); using IP free tier.")
         return ""
-
-_OIDC = github_oidc_token()
 
 def _open(req, timeout, tries=3, label="request"):
     """Transient-fault retry: 5xx / network blips get backoff; 4xx raises at once, except
@@ -214,7 +248,8 @@ def mcp_validate(code, lang, rebuttal=""):
              "User-Agent":"verificate-gate/1.0 (+https://verificate.ai)"}
         # Signed OIDC token → the portal meters the free tier per-repository (not per
         # shared runner IP) with the repo identity proven, not merely claimed.
-        if _OIDC: h["X-Verificate-OIDC"] = _OIDC
+        tok = oidc_token()
+        if tok: h["X-Verificate-OIDC"] = tok
         if VKEY: h["Authorization"] = f"Bearer {VKEY}"
         req = urllib.request.Request(MCP_URL, data=body, method="POST", headers=h)
         raw = _open(req, 120, tries=2, label=f"mcp {method}").read().decode()
@@ -277,6 +312,9 @@ def main():
     if not pr:
         print("Not a pull_request event; nothing to gate."); return 0
     mode = FAIL_ON
+    for w in (_FAIL_ON_WARNING, _MAX_FILES_WARNING):
+        if w:
+            print(f"::warning::{w}")
     try:
         files = gh_all(f"/repos/{REPO}/pulls/{pr}/files")
         if not isinstance(files, list):
@@ -315,9 +353,13 @@ def main():
     rows, vetoed_any, rejected_any, errors, capped, fixes = [], False, False, 0, False, []
     for f in targets:
         ext = file_ext(f["filename"])
+        if mode == "strict" and ext in BINARY_EXEC_EXT:
+            errors += 1
+            print(f"::warning::{f['filename']} is a compiled binary and cannot be reviewed; strict mode blocks it.")
+            rows.append((f["filename"], "⚠️ binary executable — cannot be reviewed", "")); continue
         try:
             meta = gh(f"/repos/{REPO}/contents/{urllib.parse.quote(f['filename'])}{ref_qs}")
-            code = read_file(meta)
+            code = read_file(meta, mode)
             res = mcp_validate(code, LANG.get(ext, "text"), rebuttal=rebuttal)
         except Exception as e:
             errors += 1
