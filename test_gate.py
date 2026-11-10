@@ -46,6 +46,9 @@ os.environ["GITHUB_EVENT_PATH"] = _event.name
 os.environ.pop("GITHUB_OUTPUT", None)
 
 
+posted = []
+
+
 def run(mode, files, verdicts, *, list_error=None, crash=False, max_files=25, via_entry=False, spy=None):
     """Run the gate once. verdicts maps filename -> verdict dict, or an Exception to raise."""
     gate.FAIL_ON, gate.MAX_FILES = mode, max_files
@@ -73,6 +76,7 @@ def run(mode, files, verdicts, *, list_error=None, crash=False, max_files=25, vi
 
     reviewed_names = [f["filename"] for f in gate.to_review(files, mode)]
     def comment(pr, body):
+        posted.append(body)
         if crash:  # raised outside every per-file handler, so only the global handler sees it
             raise KeyError("unexpected")
 
@@ -160,7 +164,8 @@ check("strict: a UTF-8 BOM is accepted", gate.read_file(b64(b"\xef\xbb\xbfx = 1\
 check("reject: decoding stays lenient (unchanged)", "�" in gate.read_file(b64(b"\xff\xfe"), "reject"))
 rc, reviewed = run("strict", [{"filename": "lib/native.so", "status": "added"}], {})
 check("strict: a compiled binary blocks without being sent for review", rc == 1 and reviewed == [])
-check("strict: compressed archives are not code", not gate.is_code("x.tar", "strict") and not gate.is_code("y.7z", "strict"))
+rc, reviewed = run("strict", [{"filename": "payload.tgz", "status": "added"}, {"filename": "bundle.zip", "status": "added"}], {})
+check("strict: archives block without being sent for review", rc == 1 and reviewed == [])
 check("parse_fail_on: typo falls back to reject with a warning", gate.parse_fail_on("strct")[0] == "reject" and gate.parse_fail_on("strct")[1])
 check("parse_fail_on: ' Strict ' is strict", gate.parse_fail_on(" Strict ") == ("strict", ""))
 check("parse_max_files: 500 clamps to 300 with a warning", gate.parse_max_files("500")[0] == 300 and gate.parse_max_files("500")[1])
@@ -224,6 +229,65 @@ except ValueError:
     check("an HTTP-date Retry-After waits and retries instead of crashing", False)
 finally:
     gate.time.sleep = _sleep
+
+# revision 4: response shapes, labelling, taint loading, Retry-After range, MCP body shape
+rc, reviewed = run("strict", two, {"bad.py": {"valid": True, "issues": "not a list", "protection": {"vetoed": False, "vetoed_by": [1]}}})
+check("strict: non-list issues are normalised, the file is approved and the run continues", rc == 0 and reviewed == ["bad.py", "good.py"])
+rc, reviewed = run("reject", two, {"bad.py": {"valid": False, "fix_plan": "x", "suggestions": 3, "protection": {"vetoed": True, "vetoed_by": "gate"}}})
+check("reject: malformed fix_plan/suggestions/vetoed_by do not abort; the veto still blocks", rc == 1 and reviewed == ["bad.py", "good.py"])
+check("normalize_response rejects a non-dict", gate.normalize_response("x") is None and gate.normalize_response({"valid": True, "protection": 5}) is None)
+
+rc, _ = run("strict", one, {"a.py": {"_unavailable": True, "text": "upstream 502"}})
+check("strict: a response with no verdict blocks", rc == 1)
+posted.clear()
+rc, _ = run("reject", one, {"a.py": {"_unavailable": True, "text": "upstream 502"}})
+check("an untyped unavailable response is not labelled as quota exhaustion",
+      rc == 0 and posted and "free trial" not in posted[-1] and "gate returned no verdict" in posted[-1])
+
+sys.modules["taint"] = type(sys)("taint")  # a planted module must never be the one used
+check("taint is loaded from the action's own file, not a module named 'taint' on sys.path",
+      os.path.abspath(gate._load_taint().__file__) == os.path.join(os.path.dirname(os.path.abspath(gate.__file__)), "taint.py"))
+del sys.modules["taint"]
+
+calls.clear()
+
+
+def _urlopen_neg(req, timeout):
+    calls.append(1)
+    if len(calls) == 1:
+        raise urllib.error.HTTPError("u", 429, "slow", {"Retry-After": "-5"}, None)
+    return "ok"
+
+
+slept = []
+gate._urlopen, gate.time.sleep = _urlopen_neg, lambda s: slept.append(s)
+try:
+    out = gate._open(object(), 5, tries=2)
+    check("a negative Retry-After backs off a sane positive time and retries", out == "ok" and slept and slept[0] >= 30)
+except ValueError:
+    check("a negative Retry-After backs off a sane positive time and retries", False)
+finally:
+    gate.time.sleep = _sleep
+
+
+class _Resp:
+    def __init__(self, body): self.body = body
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+    def read(self, n=-1): return self.body
+
+
+import importlib  # noqa: E402
+g2 = importlib.reload(gate)
+g2._OIDC_CACHE.append("")
+g2._open = lambda req, timeout, tries=3, label="": _Resp(b'{"jsonrpc":"2.0","id":2,"result":null}')
+check("mcp_validate: a null JSON-RPC result is 'unavailable', never an AttributeError", g2.mcp_validate("x=1", "python").get("_unavailable") is True)
+g2._open = lambda req, timeout, tries=3, label="": _Resp(b"x" * (g2.MCP_MAX_RESPONSE + 1))
+try:
+    g2.mcp_validate("x=1", "python")
+    check("mcp_validate: an oversized response is refused", False)
+except ValueError:
+    check("mcp_validate: an oversized response is refused", True)
 os.unlink(_event.name)
 
 print("\nGATE ACTION CONTRACT: " + ("FAILED %d" % len(fails) if fails else "PASSED"))

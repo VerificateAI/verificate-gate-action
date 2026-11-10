@@ -78,11 +78,13 @@ CODE_EXT = {".py",".js",".ts",".tsx",".jsx",".go",".java",".rb",".rs",".c",".cc"
 # executable behaviour. Everything else, including an unknown or missing extension, is code.
 NON_CODE_EXT = {".md",".markdown",".rst",".txt",".png",".jpg",".jpeg",".gif",".webp",".ico",
                 ".bmp",".pdf",".woff",".woff2",".ttf",".otf",".eot",".mp4",".mov",".mp3",".wav",
-                ".zip",".gz",".tgz",".7z",".xz",".bz2",".tar"}
-# Compiled or executable binaries cannot be reviewed as text. Strict mode does not skip them
-# (that would pass executable bytes nobody read); it reports them as unreviewable and blocks.
+                }
+# Compiled binaries and archives cannot be reviewed as text, and either can carry executable
+# code. Strict mode does not skip them (that would pass bytes nobody read); it reports them as
+# unreviewable and blocks.
 BINARY_EXEC_EXT = {".pyc",".pyo",".so",".dll",".dylib",".exe",".jar",".class",".bin",".o",
-                   ".a",".lib",".wasm",".whl",".node"}
+                   ".a",".lib",".wasm",".whl",".node",
+                   ".zip",".gz",".tgz",".7z",".xz",".bz2",".tar",".rar",".war"}
 LANG = {".py":"python",".js":"javascript",".ts":"typescript",".tsx":"typescript",".jsx":"javascript",
         ".mjs":"javascript",".cjs":"javascript",".go":"go",".java":"java",".rb":"ruby",".rs":"rust",
         ".c":"c",".h":"cpp",".hh":"cpp",".hpp":"cpp",".cc":"cpp",".cxx":"cpp",".cpp":"cpp",
@@ -117,7 +119,7 @@ def to_review(files, mode):
     return [f for f in files if f.get("status") in statuses and is_code(f.get("filename", ""), mode)]
 
 
-def exit_code(mode, vetoed, rejected, errors, dropped, incomplete_list=False):
+def exit_code(mode, vetoed, rejected, errors, dropped, incomplete_list):
     """The one place the check's pass/fail is decided."""
     if mode == "off":
         return 0
@@ -181,6 +183,8 @@ def _open(req, timeout, tries=3, label="request"):
                 ra_secs = float(retry_after) if retry_after else None
             except ValueError:  # RFC 9110 also allows an HTTP-date; back off a fixed amount
                 ra_secs = 30.0
+            if ra_secs is not None and not (0 <= ra_secs < float("inf")):  # negative, NaN, inf
+                ra_secs = 30.0
             if e.code in (403, 429) and ra_secs is not None and attempt < tries:
                 wait = min(ra_secs, 60) + random.uniform(0, 1)
                 print(f"::warning::{label} rate-limited; waiting {wait:.1f}s per Retry-After")
@@ -230,7 +234,21 @@ def set_output(**kv):
         return
     with open(path, "a", encoding="utf-8") as f:
         for k, v in kv.items():
-            f.write(f"{k}={str(v).replace(chr(10), ' ')}\n")
+            f.write(f"{k}={str(v).replace(chr(13), ' ').replace(chr(10), ' ')}\n")
+
+MCP_MAX_RESPONSE = 4 * 1024 * 1024  # a verdict is a few KB; cap what a bad upstream can make us buffer
+
+
+def _load_taint():
+    """Load the action's own taint.py by absolute path. A bare 'import taint' could resolve a
+    PR-supplied taint.py from the workspace or PYTHONPATH inside a job holding GITHUB_TOKEN."""
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "taint.py")
+    spec = importlib.util.spec_from_file_location("verificate_gate_taint", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
 
 def mcp_validate(code, lang, rebuttal=""):
     # A rebuttal (from .verificate/rebuttals.md) lets the gate adjudicate a prior finding the
@@ -239,7 +257,7 @@ def mcp_validate(code, lang, rebuttal=""):
     # Injection-reachability: suppress false "injection/RCE" findings whose sink is fed only by an
     # operator-controlled source (a CLI arg, local config, a trusted literal) rather than untrusted input.
     try:
-        import taint
+        taint = _load_taint()
         _t = taint.analyze(code)
         ctx["security_graph"] = {"injection_reachable": _t["injection_reachable"], "taint_flows": _t["flows"]}
     except Exception as e:
@@ -257,7 +275,11 @@ def mcp_validate(code, lang, rebuttal=""):
         if tok: h["X-Verificate-OIDC"] = tok
         if VKEY: h["Authorization"] = f"Bearer {VKEY}"
         req = urllib.request.Request(MCP_URL, data=body, method="POST", headers=h)
-        raw = _open(req, 120, tries=2, label=f"mcp {method}").read().decode()
+        with _open(req, 120, tries=2, label=f"mcp {method}") as r:
+            raw_b = r.read(MCP_MAX_RESPONSE + 1)
+        if len(raw_b) > MCP_MAX_RESPONSE:
+            raise ValueError(f"gate response exceeds {MCP_MAX_RESPONSE} bytes")
+        raw = raw_b.decode("utf-8", "replace")
         for line in raw.splitlines():
             line = line.strip()
             if line.startswith("data:"): line = line[5:].strip()
@@ -269,8 +291,11 @@ def mcp_validate(code, lang, rebuttal=""):
                        "clientInfo":{"name":"verificate-gate-action","version":"1"}}, 0)
     resp = rpc("tools/call", {"name":"validate_ai_output",
                "arguments":{"ai_output":code,"validation_type":"code_generation","context":ctx}}, 2)
-    parts = resp.get("result", {}).get("content", [])
-    text = "\n".join(p.get("text","") for p in parts if p.get("type")=="text").strip()
+    result = resp.get("result") if isinstance(resp, dict) else None
+    parts = result.get("content") if isinstance(result, dict) else None
+    parts = parts if isinstance(parts, list) else []
+    text = "\n".join(str(p.get("text", "")) for p in parts
+                     if isinstance(p, dict) and p.get("type") == "text").strip()
     if text.startswith("{"):
         try:
             obj, _ = json.JSONDecoder().raw_decode(text)  # first JSON object; ignore trailing trial note
@@ -296,6 +321,26 @@ def _not_a_verdict(obj):
         return {"_unavailable": True, "kind": "review", "reason": "review_unavailable",
                 "text": "The gate's model review did not complete for this file (timeout or transient error)."}
     return None
+
+
+def normalize_response(res):
+    """Return the gate response with every field main() reads coerced to its expected shape,
+    or None if it is not a response at all. One malformed field must not abort the run."""
+    if not isinstance(res, dict):
+        return None
+    if res.get("_unavailable"):
+        return res
+    prot, assess = res.get("protection") or {}, res.get("assessment") or {}
+    if not isinstance(prot, dict) or not isinstance(assess, dict):
+        return None
+    lst = lambda v: v if isinstance(v, list) else []
+    out = dict(res)
+    out["protection"] = dict(prot, vetoed_by=[_s(x) for x in lst(prot.get("vetoed_by"))])
+    out["assessment"] = assess
+    out["issues"] = lst(res.get("issues"))
+    out["fix_plan"] = lst(res.get("fix_plan"))
+    out["suggestions"] = lst(res.get("suggestions"))
+    return out
 
 
 def upsert_comment(pr, body):
@@ -387,16 +432,18 @@ def main():
             errors += 1
             print(f"::warning::Verificate gate error on {f['filename']}: {type(e).__name__}: {str(e)[:160]}")
             rows.append((f["filename"], "⚠️ gate error (skipped)", "")); continue
-        if not isinstance(res, dict):
-            res = {"_unavailable": True, "text": "malformed gate response"}
-        # A malformed field must cost this one file, never abort the remaining reviews.
-        if not isinstance(res.get("protection", {}), dict) or not isinstance(res.get("assessment", {}), dict):
+        res = normalize_response(res)
+        if res is None:
+            # A malformed response costs this one file, never the remaining reviews.
             errors += 1
             print(f"::warning::malformed gate response for {f['filename']}; treated as unreviewed.")
             rows.append((f["filename"], "⚠️ malformed gate response", "")); continue
         if res.get("_unavailable"):
             errors += 1
             reason = res.get("reason", "")
+            if res.get("kind") not in ("review", "access"):
+                print(f"::warning::Verificate gate returned no verdict for {f['filename']}: {_s(res.get('text', ''))[:160]}")
+                rows.append((f["filename"], "⚠️ skipped — gate returned no verdict", "")); continue
             if res.get("kind") == "review":
                 print(f"::warning::Verificate could not review {f['filename']} (gate-side timeout/transient error) — "
                       f"not blocking. Re-run the check; very large files review more reliably when split.")
