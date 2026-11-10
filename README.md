@@ -14,9 +14,22 @@ Verificate Gate reviews the code in every pull request — automatically, before
 - **Invented APIs** — calls to functions or libraries that don't exist.
 - **Placeholder code presented as finished** — mocks, stubs, `FIXME`s and hardcoded results passed off as working.
 - **Tests written to pass rather than to test** — a green tick that proves nothing.
+- **Secrets written to logs** — a password, API key, access token or access code passed to a log or console call (CWE-532).
 - **Quality problems** in the four ISO 5055 areas: security, reliability, performance efficiency and maintainability.
 
 Nothing is executed — your code is read and checked, never run.
+
+## New in November 2026
+
+- **Stronger reviewer.** The model stage now runs on Claude Haiku 5.5. On our frozen benchmark (12 cases, each reviewed 3 times), unsafe approvals fell from **6 in 36 to 0 in 36**, and all 12 clean controls were still approved. [Method and numbers](https://github.com/VerificateAI/verificate-mcp-quickstart/blob/master/BENCHMARK_2026-11.md).
+- **Two new deterministic vetoes:** secrets written to logs (Python, JS/TS, Java, Go, Rust, C#, PHP, Ruby, Swift, Kotlin) and invented Python standard-library calls. A veto fails the change whatever the model says.
+- **One decision per file, with a receipt.** Each review returns a single decision (approved, approved with conditions, rejected or incomplete) plus what was and was not verified. A review that cannot cover the file says so; it is never counted as an approval.
+- **Used hard in our own engineering:** 3,844 Gate reviews across 54 of our own projects between 7 October and 10 November 2026, 943 of them rejected and fixed.
+
+## How it works
+
+1. **Deterministic veto checks** run first — placeholders and mocks presented as done, tests that cannot fail, invented standard-library calls, secrets in logs, deceptive or evidence-free claims. Same input, same result, and no model output can override a veto.
+2. **A Claude Haiku 5.5 review** then checks the rest against ISO/IEC 25010 and ISO/IEC 5055: security, reliability, performance efficiency and maintainability, including whether third-party API calls are real. Its high or critical security and API findings block the merge.
 
 ## How to use it
 
@@ -61,7 +74,7 @@ Every pull request gets a clear verdict, in plain English, right on the PR:
 
 - **Broken AI code never reaches your application.** A rejected change turns the check red and GitHub blocks the merge until it's fixed.
 - **A tireless first reviewer.** Humans skim; the gate reads every changed file, every time.
-- **It catches what AI review misses.** In our published benchmark, a leading AI model asked to review its own code caught **0 of 6** planted problems (a fake API and a self-passing test). Verificate Gate caught **6 of 6**, every run. [See the benchmark →](https://github.com/VerificateAI/verificate-mcp-quickstart/blob/master/COMPARISON.md)
+- **It catches what AI review misses.** In our September benchmark, a leading AI model asked to review code in a normal workflow caught **0 of 6** planted problems (a fake API and a self-passing test). Verificate Gate caught **6 of 6**, every run. [See the benchmark →](https://github.com/VerificateAI/verificate-mcp-quickstart/blob/master/COMPARISON.md)
 - **Low noise, not just high recall.** The gate reasons about *reachability*: a `subprocess`/`exec`/`import` call fed by a CLI argument, a local config value, or a trusted literal is the intended behaviour of a dev tool or build script — not command injection — so it is not flagged. You get the real defects without a wall of false alarms that trains people to ignore the check.
 
 Built for teams using **GitHub Copilot, Claude Code, Cursor, Windsurf, Cline, Aider, Codex** or any AI coding assistant — the gate catches what the assistant got wrong *before* the PR lands. It works on every pull request, including AI-generated ones, and pairs with the [Verificate MCP server](https://github.com/VerificateAI/verificate-mcp-quickstart) for in-editor gating as code is written.
@@ -79,7 +92,7 @@ Start in watch mode, switch to blocking when you trust it:
 1. **Watch mode** — set `fail-on: off`. The gate comments its verdict on every PR but never blocks anything. Run it for a week and see what it catches.
 2. **Blocking mode** — set `fail-on: reject` (the default) and add the required check under **Settings → Branches → Require status checks**. In that list it appears as **`Verificate Gate / verificate-gate`** (job name / workflow). Now a rejected change can't merge until it's fixed.
 
-Rejections come only from problems the gate can point to concretely (a nonexistent API, a placeholder, a self-passing test) — in our benchmark it raised **zero false alarms on clean code** — so turning on blocking mode rarely surprises anyone.
+Rejections come with the concrete problem they point to (a nonexistent API, a placeholder, a self-passing test, a secret in a log). In the November benchmark every clean control was approved, and the new secrets-in-logs check flagged only genuine credential logging when run on 34,849 real open-source files before launch.
 
 If the Verificate service is ever unreachable, the check simply passes and says so. **An outage on our side never blocks your team's merges.**
 
@@ -132,7 +145,7 @@ The step exposes outputs you can use in later steps — auto-label a rejected PR
 
 ## Security & data handling
 
-- **Permissions:** `contents: read` (to read the changed files) and `pull-requests: write` (to post the comment). Nothing else.
+- **Permissions:** `contents: read` (to read the changed files), `pull-requests: write` (to post the comment) and, optionally, `id-token: write` (a signed GitHub token that proves the repository's identity for its own free quota). Nothing else.
 - **What leaves your runner:** the text of the changed code files is sent over HTTPS to the Verificate endpoint for review, and the verdict comes back. Your `GITHUB_TOKEN` never leaves the runner.
 - **No code execution.** Files are read and analysed, never run.
 - **Keep code in-house:** point `mcp-url` at your own Verificate deployment.
