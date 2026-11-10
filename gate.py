@@ -2,254 +2,153 @@
 
 Runs the Verificate merge gate on the changed code files of a pull request, posts an inline
 summary comment, and exits non-zero if the gate VETOES (so it can be a required status check
-that blocks merge). Design principle: fail CLOSED only on a real veto; fail OPEN on any
-infrastructure error (MCP unreachable, timeouts) so gate outages never block your merges.
+that blocks merge). Modes (FAIL_ON):
+  reject (default) - fail CLOSED only on a real veto or rejection; fail OPEN on any infrastructure
+                     error (MCP unreachable, timeouts, quota) so gate outages never block merges.
+  off              - comment only, never fail the check.
+  strict           - fail CLOSED unless every changed file was reviewed and approved: gate errors,
+                     skipped reviews, files over max-files, an incomplete file list and unexpected
+                     exceptions all fail the check. Files with an unrecognised extension are
+                     reviewed, never silently skipped. For required checks that must not fail open.
 
 Env: GITHUB_TOKEN, GITHUB_REPOSITORY, GITHUB_EVENT_PATH, optional VERIFICATE_MCP_URL,
-VERIFICATE_API_KEY, FAIL_ON (reject|off), MAX_FILES.
+VERIFICATE_API_KEY, FAIL_ON (reject|off|strict), MAX_FILES.
 """
 from __future__ import annotations
-import base64, html, json, os, random, ssl, sys, time, urllib.parse, urllib.request, urllib.error
+import base64, json, os, sys, urllib.parse, urllib.error
+
+# Load the sibling modules from the action directory only. The action runs under python -I, so
+# neither the PR workspace nor PYTHONPATH is on sys.path; this puts back exactly one trusted path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import vg_net as net  # noqa: E402
+from vg_net import MARK, REPO, gh, gh_all, mcp_validate, set_output, upsert_comment  # noqa: E402
+from vg_policy import (BINARY_EXEC_EXT, GH_FILES_LIMIT, LANG, _s, cell, exit_code, file_ext,  # noqa: E402,F401
+                       is_code, md, normalize_response, parse_fail_on, parse_max_files, read_file,
+                       review_type, to_review, _not_a_verdict)
 
 COMMENT_MAX = 60000  # keep under GitHub's 65536-char comment limit
 
-def _s(v):
-    """Coerce a finding (str or dict) to a clean one-line string."""
-    if isinstance(v, dict):
-        v = v.get("description") or v.get("message") or v.get("step") or json.dumps(v)
-    return " ".join(str(v).split())
-
-def cell(v):
-    """Safe for a markdown table cell: no pipes or newlines break the table."""
-    return _s(v).replace("|", "\\|")[:180]
-
-def md(v):
-    """Safe for markdown/HTML body text: escape angle brackets so AI text can't
-    close our <details> block or inject HTML. Slice BEFORE escaping so we never
-    split an HTML entity (e.g. '&lt;')."""
-    return html.escape(_s(v)[:220], quote=False)
-
-REPO = os.environ.get("GITHUB_REPOSITORY", "")
-TOKEN = os.environ.get("GITHUB_TOKEN", "")
-# GitHub Actions OIDC: present only if the caller's workflow grants `permissions: id-token: write`.
-OIDC_REQ_URL = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL", "")
-OIDC_REQ_TOKEN = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "")
-MCP_URL = os.environ.get("VERIFICATE_MCP_URL", "https://mcp.verificate.ai/mcp")
-VKEY = os.environ.get("VERIFICATE_API_KEY", "").strip()
-FAIL_ON = os.environ.get("FAIL_ON", "reject").strip().lower()
-try:
-    MAX_FILES = int(os.environ.get("MAX_FILES", "25"))
-except ValueError:
-    print(f"::warning::max-files '{os.environ.get('MAX_FILES')}' is not an integer; using 25.")
-    MAX_FILES = 25
-MAX_FILES = max(1, min(MAX_FILES, 300))
-MARK = "<!-- verificate-gate -->"
-CODE_EXT = {".py",".js",".ts",".tsx",".jsx",".go",".java",".rb",".rs",".c",".cc",".cpp",
-            ".cs",".php",".sql",".sh",".kt",".swift",".scala"}
-LANG = {".py":"python",".js":"javascript",".ts":"typescript",".tsx":"typescript",".jsx":"javascript",
-        ".go":"go",".java":"java",".rb":"ruby",".rs":"rust",".cpp":"cpp",".cs":"csharp",".php":"php",".sql":"sql"}
-_ctx = ssl.create_default_context()
-
-def github_oidc_token():
-    """Fetch a GitHub Actions OIDC JWT (audience=verificate-gate) so the gate's free tier
-    can meter per-repository instead of per shared-runner IP. Returns '' if the workflow
-    didn't grant `permissions: id-token: write` — the gate then falls back to the IP tier."""
-    if not OIDC_REQ_URL or not OIDC_REQ_TOKEN:
-        return ""
-    try:
-        req = urllib.request.Request(OIDC_REQ_URL + "&audience=verificate-gate",
-            headers={"Authorization": f"Bearer {OIDC_REQ_TOKEN}", "User-Agent": "verificate-gate"})
-        with urllib.request.urlopen(req, context=_ctx, timeout=15) as r:
-            return (json.loads(r.read() or b"{}").get("value") or "").strip()
-    except Exception as e:
-        print(f"::warning::could not obtain OIDC token ({type(e).__name__}); using IP free tier.")
-        return ""
-
-_OIDC = github_oidc_token()
-
-def _open(req, timeout, tries=3, label="request"):
-    """Transient-fault retry: 5xx / network blips get backoff; 4xx raises at once, except
-    secondary rate limits (403/429 with Retry-After), which wait the header's duration."""
-    last = None
-    for attempt in range(1, tries + 1):
-        try:
-            return _urlopen(req, timeout)
-        except urllib.error.HTTPError as e:
-            last = e
-            retry_after = e.headers.get("Retry-After") if e.headers else None
-            if e.code in (403, 429) and retry_after and attempt < tries:
-                wait = min(float(retry_after), 60) + random.uniform(0, 1)
-                print(f"::warning::{label} rate-limited; waiting {wait:.1f}s per Retry-After")
-                time.sleep(wait)
-                continue
-            if e.code in (401, 403, 404, 422, 429) or attempt == tries:
-                raise
-        except (urllib.error.URLError, TimeoutError, ssl.SSLError, ConnectionError, OSError) as e:
-            last = e
-            if attempt == tries:
-                raise
-        wait = (2 ** attempt) + random.uniform(0, 1)
-        print(f"::warning::{label} failed (attempt {attempt}/{tries}); retrying in {wait:.1f}s")
-        time.sleep(wait)
-    raise last
-
-def _urlopen(req, timeout):
-    return urllib.request.urlopen(req, context=_ctx, timeout=timeout)
-
-def gh(path, method="GET", data=None):
-    req = urllib.request.Request("https://api.github.com" + path, method=method,
-        headers={"Authorization": f"Bearer {TOKEN}", "Accept": "application/vnd.github+json",
-                 "User-Agent": "verificate-gate"})
-    if data is not None:
-        req.data = json.dumps(data).encode()
-        req.add_header("Content-Type", "application/json")
-    with _open(req, 30, label=f"github {method} {path[:60]}") as r:
-        return json.loads(r.read() or b"{}")
-
-def gh_all(path):
-    """Follow per_page pagination so large PRs are fully enumerated."""
-    out, page = [], 1
-    while True:
-        chunk = gh(("&" if "?" in path else "?").join([path, f"per_page=100&page={page}"]))
-        if not isinstance(chunk, list):
-            return chunk
-        out += chunk
-        if len(chunk) < 100:
-            return out
-        page += 1
-        if page > 30:
-            return out
-
-def set_output(**kv):
-    path = os.environ.get("GITHUB_OUTPUT")
-    if not path:
-        return
-    with open(path, "a", encoding="utf-8") as f:
-        for k, v in kv.items():
-            f.write(f"{k}={str(v).replace(chr(10), ' ')}\n")
-
-def mcp_validate(code, lang, rebuttal=""):
-    # A rebuttal (from .verificate/rebuttals.md) lets the gate adjudicate a prior finding the
-    # agent contests with proof — the gate overturns findings whose methodology it accepts.
-    ctx = {"language": lang}
-    # Injection-reachability: suppress false "injection/RCE" findings whose sink is fed only by an
-    # operator-controlled source (a CLI arg, local config, a trusted literal) rather than untrusted input.
-    try:
-        import taint
-        _t = taint.analyze(code)
-        ctx["security_graph"] = {"injection_reachable": _t["injection_reachable"], "taint_flows": _t["flows"]}
-    except Exception:
-        pass
-    if rebuttal:
-        ctx["rebuttal"] = rebuttal[:6000]
-    def rpc(method, params, rid):
-        body = json.dumps({"jsonrpc":"2.0","id":rid,"method":method,"params":params}).encode()
-        h = {"Content-Type":"application/json","Accept":"application/json, text/event-stream",
-             "User-Agent":"verificate-gate/1.0 (+https://verificate.ai)"}
-        # Signed OIDC token → the portal meters the free tier per-repository (not per
-        # shared runner IP) with the repo identity proven, not merely claimed.
-        if _OIDC: h["X-Verificate-OIDC"] = _OIDC
-        if VKEY: h["Authorization"] = f"Bearer {VKEY}"
-        req = urllib.request.Request(MCP_URL, data=body, method="POST", headers=h)
-        raw = _open(req, 120, tries=2, label=f"mcp {method}").read().decode()
-        for line in raw.splitlines():
-            line = line.strip()
-            if line.startswith("data:"): line = line[5:].strip()
-            if line.startswith("{"):
-                try: return json.loads(line)
-                except json.JSONDecodeError: continue
-        return {}
-    rpc("initialize", {"protocolVersion":"2024-11-05","capabilities":{},
-                       "clientInfo":{"name":"verificate-gate-action","version":"1"}}, 0)
-    resp = rpc("tools/call", {"name":"validate_ai_output",
-               "arguments":{"ai_output":code,"validation_type":"code_generation","context":ctx}}, 2)
-    parts = resp.get("result", {}).get("content", [])
-    text = "\n".join(p.get("text","") for p in parts if p.get("type")=="text").strip()
-    if text.startswith("{"):
-        try:
-            obj, _ = json.JSONDecoder().raw_decode(text)  # first JSON object; ignore trailing trial note
-            return _not_a_verdict(obj) or obj
-        except json.JSONDecodeError:
-            pass
-    # Not a verdict (e.g. free-tier upsell / trial note) — the gate could not score this.
-    return {"_unavailable": True, "text": text[:200]}
-
-def _not_a_verdict(obj):
-    """The gate answers quota/key refusals and "could not review" as JSON with valid:false. Those say
-    NOTHING about the code, so they must not be read as a rejection: until v1.2.1 an exhausted free
-    tier, an expired/invalid key, or a gate-side review timeout marked every file "REJECTED" and
-    blocked the merge — the opposite of what the README promises. Returns an _unavailable marker
-    (with the reason, so the PR comment can say what to do), or None for a real verdict."""
-    if not isinstance(obj, dict):
-        return None
-    if obj.get("validation_type") == "quota" or obj.get("provider") == "quota-gate":
-        reason = str((obj.get("quota") or {}).get("reason") or "free_limit")
-        msg = (obj.get("suggestions") or obj.get("issues") or [""])[0]
-        return {"_unavailable": True, "kind": "access", "reason": reason, "text": str(msg)[:300]}
-    if obj.get("review_unavailable"):
-        return {"_unavailable": True, "kind": "review", "reason": "review_unavailable",
-                "text": "The gate's model review did not complete for this file (timeout or transient error)."}
-    return None
-
-
-def upsert_comment(pr, body):
-    try:
-        comments = gh(f"/repos/{REPO}/issues/{pr}/comments?per_page=100")
-        existing = next((c for c in comments if MARK in (c.get("body") or "")), None)
-        if existing:
-            gh(f"/repos/{REPO}/issues/comments/{existing['id']}", "PATCH", {"body": body})
-        else:
-            gh(f"/repos/{REPO}/issues/{pr}/comments", "POST", {"body": body})
-    except Exception as e:
-        print(f"::warning::could not post comment: {e}")
+# Pure parsing at import; the warnings are printed by main(), not as an import side effect.
+FAIL_ON, _FAIL_ON_WARNING = parse_fail_on(os.environ.get("FAIL_ON", "reject"))
+MAX_FILES, _MAX_FILES_WARNING = parse_max_files(os.environ.get("MAX_FILES", "25"))
 
 def main():
-    ev = json.load(open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8"))
+    mode = FAIL_ON
+    with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as fh:
+        ev = json.load(fh)
     pr = (ev.get("pull_request") or {}).get("number") or ev.get("number")
     head = ((ev.get("pull_request") or {}).get("head") or {}).get("sha") or ""
+    base = ((ev.get("pull_request") or {}).get("base") or {}).get("sha") or ""
     ref_qs = f"?ref={head}" if head else ""
     if not pr:
+        if mode == "strict":
+            # A required check must not go green on an event that carries no pull request
+            # (merge_group, push, ...): nothing was reviewed.
+            print("::error::Not a pull_request event; strict mode reviews pull requests only and blocks here.")
+            return 1
         print("Not a pull_request event; nothing to gate."); return 0
+    for w in (_FAIL_ON_WARNING, _MAX_FILES_WARNING):
+        if w:
+            print(f"::warning::{w}")
+    if mode == "strict" and not head:
+        # Without the event's head SHA the contents would be read at the default branch.
+        print("::error::the event carries no pull request head SHA; strict mode blocks this run.")
+        set_output(verdict="error", files_reviewed=0, files_errored=0, files_dropped=0)
+        return 1
+
+    def head_moved():
+        """The file list describes the PR's CURRENT head; the contents are read at the event's
+        head. Checked before AND after listing, so a push in between cannot slip through."""
+        live = ((gh(f"/repos/{REPO}/pulls/{pr}").get("head") or {}).get("sha") or "")
+        if live != head:
+            print(f"::error::the pull request head moved ({head[:12]} -> {live[:12]}) since this event; "
+                  "strict mode blocks this run. The run for the new head gates it.")
+            set_output(verdict="error", files_reviewed=0, files_errored=0, files_dropped=0)
+            return True
+        return False
+
     try:
-        files = gh_all(f"/repos/{REPO}/pulls/{pr}/files")
+        if mode == "strict" and head_moved():
+            return 1
+        files, complete = gh_all(f"/repos/{REPO}/pulls/{pr}/files")
+        if mode == "strict" and head_moved():
+            return 1
     except Exception as e:
+        if mode == "strict":
+            print(f"::error::could not list files ({type(e).__name__}); strict mode blocks the merge.")
+            set_output(verdict="error", files_reviewed=0, files_errored=0, files_dropped=0)
+            return 1
         print(f"::warning::could not list files ({e}); failing open."); return 0
-    eligible = [f for f in files if f.get("status") in ("added","modified")
-                and any(f["filename"].endswith(e) for e in CODE_EXT)]
+    incomplete_list = (not complete) or len(files) >= GH_FILES_LIMIT
+    if incomplete_list:
+        print(f"::warning::the pull request lists {len(files)} files, GitHub's maximum; the list may be incomplete.")
+    eligible = to_review(files, mode)
     targets = eligible[:MAX_FILES]
     dropped = len(eligible) - len(targets)
     if dropped:
         print(f"::warning::Verificate Gate reviewed the first {MAX_FILES} of {len(eligible)} changed code files; "
               f"{dropped} were left unreviewed. Raise max-files to cover the whole PR.")
     if not targets:
-        upsert_comment(pr, f"{MARK}\n### ✅ Verificate Gate — no code changes to review.")
-        print("No code files changed."); return 0
+        rc = exit_code(mode, False, False, 0, 0, incomplete_list)
+        if rc:
+            upsert_comment(pr, f"{MARK}\n### ⚠️ Verificate Gate — strict mode: the file list may be incomplete "
+                               "(GitHub's 3000-file ceiling), so the check is red. Split the PR.")
+        else:
+            upsert_comment(pr, f"{MARK}\n### ✅ Verificate Gate — no code changes to review.")
+        print("No code files changed." if not rc else "::error::strict mode: the file list may be incomplete.")
+        set_output(verdict="error" if rc else "approved", files_reviewed=0, files_errored=0, files_dropped=0)
+        return rc
 
     # Appeal channel: if the author (or their agent) contested prior findings with a proof in
     # .verificate/rebuttals.md, feed it to the gate so it can adjudicate and overturn sound rebuttals.
+    # In strict mode the rebuttals come from the PR's BASE commit, never its head: the PR being
+    # gated must not be able to overrule its own findings. A rebuttal takes effect once it has
+    # itself been reviewed and merged.
     rebuttal = ""
-    try:
-        rb = gh(f"/repos/{REPO}/contents/.verificate/rebuttals.md{ref_qs}")
-        rebuttal = base64.b64decode(rb["content"]).decode("utf-8", "replace")
-        if rebuttal.strip():
-            print("Verificate: rebuttals.md found — the gate will adjudicate contested findings.")
-    except Exception:
-        pass  # no rebuttals file is the normal case
+    rb_ref = (f"?ref={base}" if base else None) if mode == "strict" else ref_qs
+    if rb_ref is None:
+        print("::warning::strict mode: no base commit in the event, so no rebuttals are read.")
+    else:
+        try:
+            rb = gh(f"/repos/{REPO}/contents/.verificate/rebuttals.md{rb_ref}")
+            rebuttal = base64.b64decode(rb["content"]).decode("utf-8", "replace")
+            if rebuttal.strip():
+                print("Verificate: rebuttals.md found — the gate will adjudicate contested findings.")
+        except urllib.error.HTTPError as e:
+            if e.code != 404:  # 404 = no rebuttals file, the normal case
+                print(f"::warning::could not read .verificate/rebuttals.md (HTTP {e.code}); reviewing without rebuttals.")
+        except Exception as e:
+            print(f"::warning::could not read .verificate/rebuttals.md ({type(e).__name__}); reviewing without rebuttals.")
 
     rows, vetoed_any, rejected_any, errors, capped, fixes = [], False, False, 0, False, []
     for f in targets:
-        ext = "." + f["filename"].rsplit(".",1)[-1]
+        ext = file_ext(f["filename"])
+        if mode == "strict" and ext in BINARY_EXEC_EXT:
+            errors += 1
+            print(f"::warning::{f['filename']} is a compiled binary and cannot be reviewed; strict mode blocks it.")
+            rows.append((f["filename"], "⚠️ binary executable — cannot be reviewed", "")); continue
         try:
             meta = gh(f"/repos/{REPO}/contents/{urllib.parse.quote(f['filename'])}{ref_qs}")
-            code = base64.b64decode(meta["content"]).decode("utf-8","replace")
-            res = mcp_validate(code, LANG.get(ext, "text"), rebuttal=rebuttal)
+            code = read_file(meta, mode)
+            res = mcp_validate(code, LANG.get(ext, "text"), rebuttal=rebuttal,
+                               validation_type=review_type(f["filename"]),
+                               reachability_hint=(mode != "strict"))
         except Exception as e:
             errors += 1
             print(f"::warning::Verificate gate error on {f['filename']}: {type(e).__name__}: {str(e)[:160]}")
             rows.append((f["filename"], "⚠️ gate error (skipped)", "")); continue
+        res = normalize_response(res)
+        if res is None:
+            # A malformed response costs this one file, never the remaining reviews.
+            errors += 1
+            print(f"::warning::malformed gate response for {f['filename']}; treated as unreviewed.")
+            rows.append((f["filename"], "⚠️ malformed gate response", "")); continue
         if res.get("_unavailable"):
             errors += 1
             reason = res.get("reason", "")
+            if res.get("kind") not in ("review", "access"):
+                print(f"::warning::Verificate gate returned no verdict for {f['filename']}: {_s(res.get('text', ''))[:160]}")
+                rows.append((f["filename"], "⚠️ skipped — gate returned no verdict", "")); continue
             if res.get("kind") == "review":
                 print(f"::warning::Verificate could not review {f['filename']} (gate-side timeout/transient error) — "
                       f"not blocking. Re-run the check; very large files review more reliably when split.")
@@ -271,6 +170,11 @@ def main():
         if rejected: rejected_any = True
         status = "❌ REJECTED" if rejected else "✅ approved"
         detail = ("vetoed by " + ", ".join(prot.get("vetoed_by") or [])) if vetoed else (f"score {score}" if score is not None else "")
+        if mode == "strict" and not rejected and res.get("valid") is not True:
+            # Strict requires a positive approval; a response with no verdict is not one.
+            errors += 1
+            rows.append((f["filename"], "⚠️ no verdict returned", detail))
+            continue
         rows.append((f["filename"], status, detail))
         for iss in issues[:4]:
             rows.append(("　↳", cell(iss), ""))
@@ -364,9 +268,13 @@ def main():
                   "The check stays red until every reviewed file passes."]
     else:
         lines += ["", "No blocking findings. " + ("Warnings noted above." if errors else "Changes cleared the gate.")]
+    if mode == "strict" and (errors or dropped or incomplete_list):
+        lines += ["", "**Strict mode: not every changed file was reviewed and approved, so the check is red.** "
+                  "Re-run the check once the gate is reachable, or split the PR so it is within `max-files`."]
     if capped:
         lines += ["", "> ⚠️ **Some files were skipped — the shared free trial on this runner is used up, so the gate couldn't score them.** "
-                  "The gate failed **open**, so this did **not** block your merge. "
+                  + ("Strict mode blocks the merge until they are reviewed. " if mode == "strict" else
+                     "The gate failed **open**, so this did **not** block your merge. ") +
                   "To get your own quota (free, no card, 30 days), sign up at "
                   "[verificate.ai/auth/signup](https://verificate.ai/auth/signup) and add the key as a repo secret named "
                   "**`VERIFICATE_API_KEY`** — validations resume on the next push."]
@@ -377,23 +285,42 @@ def main():
     upsert_comment(pr, "\n".join(lines))
 
     set_output(
-        verdict="vetoed" if vetoed_any else ("rejected" if rejected_any else ("error" if errors else "approved")),
+        # The output must never say "approved" for a run whose check is red.
+        verdict="vetoed" if vetoed_any else ("rejected" if rejected_any else (
+            "error" if (errors or (mode == "strict" and (dropped or incomplete_list))) else "approved")),
         files_reviewed=len(targets),
         files_errored=errors,
         files_dropped=dropped,
     )
 
-    if (vetoed_any or rejected_any) and FAIL_ON == "reject":
+    rc = exit_code(mode, vetoed_any, rejected_any, errors, dropped, incomplete_list)
+    if rc and (vetoed_any or rejected_any):
         why = "VETOED by a deterministic reality gate" if vetoed_any else "REJECTED"
         print(f"::error::Verificate Gate: a change was {why} — blocking merge until fixed.")
-        return 1
-    print("Verificate Gate: passed.")
-    return 0
+    elif rc:
+        print(f"::error::Verificate Gate (strict): {errors} file(s) not reviewed, {dropped} over max-files"
+              + (", file list may be incomplete" if incomplete_list else "") + " — blocking merge.")
+    else:
+        print("Verificate Gate: passed.")
+    return rc
+
+
+def entry():
+    """Process entry point. reject/off fail open on an unexpected error; strict fails closed."""
+    try:
+        return main()
+    except Exception as e:
+        if FAIL_ON == "strict":
+            print(f"::error::Verificate Gate errored ({type(e).__name__}); strict mode blocks the merge.")
+            # Best effort: leave downstream jobs a verdict. A failure here must not mask the block.
+            try:
+                set_output(verdict="error", files_reviewed=0, files_errored=0, files_dropped=0)
+            except Exception as oe:
+                print(f"::warning::could not write step outputs ({type(oe).__name__}).")
+            return 1
+        print(f"::warning::Verificate Gate errored, failing open: {e}")
+        return 0
+
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except Exception as e:
-        # Global fail-open: never block a merge on an unexpected gate error.
-        print(f"::warning::Verificate Gate errored, failing open: {e}")
-        sys.exit(0)
+    sys.exit(entry())

@@ -7,7 +7,7 @@ inputs:
     required: false
     default: ""
   fail-on:
-    description: "'reject' = fail the check (block merge) on a veto; 'off' = comment only."
+    description: "'reject' = fail the check (block merge) on a veto or rejection, fail open on gate errors; 'off' = comment only; 'strict' = fail the check unless every changed non-prose file was reviewed and approved (gate errors, skipped reviews and files over max-files all block)."
     required: false
     default: "reject"
   max-files:
@@ -20,7 +20,7 @@ inputs:
     default: "https://mcp.verificate.ai/mcp"
 outputs:
   verdict:
-    description: "Overall gate verdict: 'approved', 'rejected', 'vetoed', or 'error' (gate failures never block merges)."
+    description: "Overall gate verdict: 'approved', 'rejected', 'vetoed', or 'error' (gate failures block merges only with fail-on: strict)."
     value: ${{ steps.gate.outputs.verdict }}
   files_reviewed:
     description: "Number of changed code files reviewed in this pull request."
@@ -37,7 +37,7 @@ runs:
     - uses: actions/setup-python@v5
       with: { python-version: "3.11" }
     - id: gate
-      run: python "${{ github.action_path }}/gate.py"
+      run: python -I "${{ github.action_path }}/gate.py"
       shell: bash
       env:
         GITHUB_TOKEN: ${{ github.token }}

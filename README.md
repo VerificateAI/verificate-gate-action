@@ -94,7 +94,9 @@ Start in watch mode, switch to blocking when you trust it:
 
 Rejections come with the concrete problem they point to (a nonexistent API, a placeholder, a self-passing test, a secret in a log). In the November benchmark every clean control was approved, and the new secrets-in-logs check flagged only genuine credential logging when run on 34,849 real open-source files before launch.
 
-If the Verificate service is ever unreachable, the check simply passes and says so. **An outage on our side never blocks your team's merges.**
+If the Verificate service is ever unreachable, the check simply passes and says so. **In the default `reject` mode, an outage on our side never blocks your team's merges.**
+
+3. **Strict mode** — set `fail-on: strict` when the check must never pass on code it did not review, for example a required org-wide check. The check fails unless every changed file was reviewed and approved. Gate errors, quota or key refusals, a review that did not complete, files over `max-files`, and unexpected errors all fail it. Every changed file is reviewed except prose and media (`.md`, `.rst`, `.txt`, images, fonts, audio and video), so a file with an unknown or missing extension is reviewed rather than skipped. Agent instruction files (`AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, `.cursorrules`, anything under `.claude/`, `.cursor/` or `.github/instructions/`) are reviewed as documentation, because they steer generated code. Compiled binaries and archives cannot be reviewed as text, so they block. The check also blocks on a non-pull-request event, and when the PR head has moved since the event. It reads `.verificate/rebuttals.md` from the base branch, so a PR cannot overrule its own findings. It sends no reachability hint derived from the code under review. An outage blocks merges in this mode, by design.
 
 > **Busy shared runners:** the free tier is shared per runner, so on a busy shared runner it can already be used up. A free key of your own (no card, 30 days — [verificate.ai/auth/signup](https://verificate.ai/auth/signup)) gives you a private quota: add it as a repository secret named `VERIFICATE_API_KEY` and pass it as shown below.
 
@@ -105,7 +107,7 @@ All settings are optional.
 | Setting | Default | What it does |
 |---|---|---|
 | `verificate-api-key` | — | Your own free key, for a private quota (the shared free tier works without one). |
-| `fail-on` | `reject` | `reject` = block the merge on a rejected change; `off` = comment only (watch mode). |
+| `fail-on` | `reject` | `reject` = block the merge on a rejected change; `off` = comment only (watch mode); `strict` = block unless every changed file was reviewed and approved (fails closed on gate errors and skipped files). An unrecognised value falls back to `reject`. |
 | `max-files` | `25` | Most changed code files reviewed per pull request. If a PR changes more, the gate reviews the first `max-files`, flags the rest in the PR comment, and leaves them unreviewed — raise this for large PRs. |
 | `mcp-url` | `https://mcp.verificate.ai/mcp` | Point at your own Verificate deployment if your code must not leave your infrastructure. |
 
@@ -122,7 +124,7 @@ The step exposes outputs you can use in later steps — auto-label a rejected PR
 
 | Output | Value |
 |---|---|
-| `verdict` | `approved` / `rejected` / `vetoed` / `error` (transient gate failures never block merges) |
+| `verdict` | `approved` / `rejected` / `vetoed` / `error` (transient gate failures block merges only with `fail-on: strict`) |
 | `files_reviewed` | Changed code files reviewed |
 | `files_errored` | Files skipped (transient error or quota) |
 | `files_dropped` | Files beyond `max-files` that were left unreviewed |
@@ -137,8 +139,8 @@ The step exposes outputs you can use in later steps — auto-label a rejected PR
 ## FAQ
 
 - **Do PRs from forks get reviewed?** Yes — the free tier uses GitHub's signed OIDC token, not a repository secret, so fork PRs work with `id-token: write`. (GitHub never hands secrets to fork-originated PRs; OIDC is unaffected.)
-- **What if the shared free tier is used up on a busy runner?** The gate fails open with a note on the PR and never blocks the merge. A free key ([verificate.ai/auth/signup](https://verificate.ai/auth/signup), no card) gives the repo its own quota as `VERIFICATE_API_KEY`.
-- **What if Verificate is down or the network blips?** The gate retries transient failures and then fails open: an outage on the Verificate side never blocks your team's merges.
+- **What if the shared free tier is used up on a busy runner?** The gate fails open with a note on the PR and never blocks the merge (except with `fail-on: strict`). A free key ([verificate.ai/auth/signup](https://verificate.ai/auth/signup), no card) gives the repo its own quota as `VERIFICATE_API_KEY`.
+- **What if Verificate is down or the network blips?** The gate retries transient failures and then fails open: an outage on the Verificate side never blocks your team's merges. With `fail-on: strict` it fails closed instead.
 - **Big PRs?** The gate reviews up to `max-files` (default 25, up to 300) changed code files per PR and notes the remainder on the PR. Raise the cap or review locally for the full detail.
 - **Must code leave our infrastructure?** No — point `mcp-url` at your own Verificate deployment and nothing leaves your environment.
 - **Disagree with a finding?** Add a proof-backed entry to `.verificate/rebuttals.md` — the gate re-adjudicates on the next run and overturns findings whose methodology holds.
