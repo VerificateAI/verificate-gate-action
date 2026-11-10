@@ -370,6 +370,27 @@ with open(outs.name, encoding="utf-8") as fh:
     out_text = fh.read()
 check("strict: an unexpected error still writes verdict=error for downstream jobs", rc == 1 and "verdict=error" in out_text)
 os.environ.pop("GITHUB_OUTPUT", None); os.unlink(outs.name)
+
+
+def outputs_of(mode, files, **kw):
+    o = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8"); o.close()
+    os.environ["GITHUB_OUTPUT"] = o.name
+    posted.clear()
+    try:
+        rc, _ = run(mode, files, {}, **kw)
+        with open(o.name, encoding="utf-8") as fh:
+            return rc, fh.read(), (posted[-1] if posted else "")
+    finally:
+        os.environ.pop("GITHUB_OUTPUT", None); os.unlink(o.name)
+
+
+rc, out, _ = outputs_of("strict", many, max_files=3)
+check("strict: over max-files the output verdict is error, matching the red check", rc == 1 and "verdict=error" in out)
+rc, out, body = outputs_of("strict", [{"filename": f"d{i}.md", "status": "modified"} for i in range(gate.GH_FILES_LIMIT)])
+check("strict: a truncated list with no targets is red in the check, the output and the comment",
+      rc == 1 and "verdict=error" in out and "✅" not in body)
+rc, out, _ = outputs_of("reject", many, max_files=3)
+check("reject: over max-files the output stays approved (unchanged)", rc == 0 and "verdict=approved" in out)
 os.unlink(_event.name)
 
 print("\nGATE ACTION CONTRACT: " + ("FAILED %d" % len(fails) if fails else "PASSED"))

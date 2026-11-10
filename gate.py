@@ -89,9 +89,15 @@ def main():
         print(f"::warning::Verificate Gate reviewed the first {MAX_FILES} of {len(eligible)} changed code files; "
               f"{dropped} were left unreviewed. Raise max-files to cover the whole PR.")
     if not targets:
-        upsert_comment(pr, f"{MARK}\n### ✅ Verificate Gate — no code changes to review.")
-        print("No code files changed.")
-        return exit_code(mode, False, False, 0, 0, incomplete_list)
+        rc = exit_code(mode, False, False, 0, 0, incomplete_list)
+        if rc:
+            upsert_comment(pr, f"{MARK}\n### ⚠️ Verificate Gate — strict mode: the file list may be incomplete "
+                               "(GitHub's 3000-file ceiling), so the check is red. Split the PR.")
+        else:
+            upsert_comment(pr, f"{MARK}\n### ✅ Verificate Gate — no code changes to review.")
+        print("No code files changed." if not rc else "::error::strict mode: the file list may be incomplete.")
+        set_output(verdict="error" if rc else "approved", files_reviewed=0, files_errored=0, files_dropped=0)
+        return rc
 
     # Appeal channel: if the author (or their agent) contested prior findings with a proof in
     # .verificate/rebuttals.md, feed it to the gate so it can adjudicate and overturn sound rebuttals.
@@ -279,7 +285,9 @@ def main():
     upsert_comment(pr, "\n".join(lines))
 
     set_output(
-        verdict="vetoed" if vetoed_any else ("rejected" if rejected_any else ("error" if errors else "approved")),
+        # The output must never say "approved" for a run whose check is red.
+        verdict="vetoed" if vetoed_any else ("rejected" if rejected_any else (
+            "error" if (errors or (mode == "strict" and (dropped or incomplete_list))) else "approved")),
         files_reviewed=len(targets),
         files_errored=errors,
         files_dropped=dropped,
