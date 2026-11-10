@@ -46,7 +46,7 @@ os.environ["GITHUB_EVENT_PATH"] = _event.name
 os.environ.pop("GITHUB_OUTPUT", None)
 
 
-def run(mode, files, verdicts, *, list_error=None, crash=False, max_files=25, via_entry=False):
+def run(mode, files, verdicts, *, list_error=None, crash=False, max_files=25, via_entry=False, spy=None):
     """Run the gate once. verdicts maps filename -> verdict dict, or an Exception to raise."""
     gate.FAIL_ON, gate.MAX_FILES = mode, max_files
     reviewed = []
@@ -57,6 +57,8 @@ def run(mode, files, verdicts, *, list_error=None, crash=False, max_files=25, vi
         return [dict(f) for f in files]
 
     def gh(path, method="GET", data=None):
+        if spy is not None:
+            spy.append(path)
         if "/contents/.verificate/" in path:
             raise RuntimeError("no rebuttals")
         return {"encoding": "base64", "content": base64.b64encode(b"x = 1\n").decode()}
@@ -165,6 +167,63 @@ check("parse_max_files: 500 clamps to 300 with a warning", gate.parse_max_files(
 check("parse_max_files: junk falls back to 25 with a warning", gate.parse_max_files("lots")[0] == 25 and gate.parse_max_files("lots")[1])
 check("parse_max_files: 40 is accepted silently", gate.parse_max_files("40") == (40, ""))
 check("importing gate made no OIDC request", gate._OIDC_CACHE == [])
+
+
+# revision 3: non-PR events, rebuttal source, malformed responses, cell, Retry-After
+def set_event(ev):
+    with open(_event.name, "w", encoding="utf-8") as fh:
+        json.dump(ev, fh)
+
+
+set_event({"ref": "refs/heads/main"})
+rc, _ = run("strict", one, {})
+check("strict: a non-pull_request event fails the check", rc == 1)
+rc, _ = run("reject", one, {})
+check("reject: a non-pull_request event passes (unchanged)", rc == 0)
+
+set_event({"pull_request": {"number": 7, "head": {"sha": "HEADSHA"}, "base": {"sha": "BASESHA"}}})
+seen = []
+
+
+def run_capturing(mode):
+    return run(mode, one, {}, spy=seen)
+
+
+seen.clear(); run_capturing("strict")
+rb = [p for p in seen if "rebuttals.md" in p]
+check("strict: rebuttals are read from the base commit, never the PR head", rb == ["/repos/example/repo/contents/.verificate/rebuttals.md?ref=BASESHA"])
+check("strict: the reviewed code is still read from the PR head", any(p.endswith("a.py?ref=HEADSHA") for p in seen))
+seen.clear(); run_capturing("reject")
+check("reject: rebuttals still come from the PR head (unchanged)", [p for p in seen if "rebuttals.md" in p] == ["/repos/example/repo/contents/.verificate/rebuttals.md?ref=HEADSHA"])
+
+two = [{"filename": "bad.py", "status": "modified"}, {"filename": "good.py", "status": "modified"}]
+rc, reviewed = run("strict", two, {"bad.py": {"valid": True, "protection": "oops"}})
+check("strict: a malformed response blocks and the remaining files are still reviewed", rc == 1 and reviewed == ["bad.py", "good.py"])
+rc, reviewed = run("reject", two, {"bad.py": {"valid": True, "protection": None}})
+check("reject: a malformed response no longer aborts the run", rc == 0 and reviewed == ["bad.py", "good.py"])
+
+check("cell never ends in a lone backslash after truncation", not gate.cell("a" * 179 + "|tail").endswith("\\"))
+
+import urllib.error  # noqa: E402
+calls = []
+
+
+def _urlopen_date(req, timeout):
+    calls.append(1)
+    if len(calls) == 1:
+        raise urllib.error.HTTPError("u", 429, "slow", {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}, None)
+    return "ok"
+
+
+gate._urlopen, _sleep = _urlopen_date, gate.time.sleep
+gate.time.sleep = lambda s: None
+try:
+    out = gate._open(object(), 5, tries=2)
+    check("an HTTP-date Retry-After waits and retries instead of crashing", out == "ok" and len(calls) == 2)
+except ValueError:
+    check("an HTTP-date Retry-After waits and retries instead of crashing", False)
+finally:
+    gate.time.sleep = _sleep
 os.unlink(_event.name)
 
 print("\nGATE ACTION CONTRACT: " + ("FAILED %d" % len(fails) if fails else "PASSED"))

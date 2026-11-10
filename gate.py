@@ -27,7 +27,8 @@ def _s(v):
 
 def cell(v):
     """Safe for a markdown table cell: no pipes or newlines break the table."""
-    return _s(v).replace("|", "\\|")[:180]
+    # Truncate BEFORE escaping so a cut can never leave a lone trailing backslash.
+    return _s(v)[:180].replace("|", "\\|")
 
 def md(v):
     """Safe for markdown/HTML body text: escape angle brackets so AI text can't
@@ -176,8 +177,12 @@ def _open(req, timeout, tries=3, label="request"):
         except urllib.error.HTTPError as e:
             last = e
             retry_after = e.headers.get("Retry-After") if e.headers else None
-            if e.code in (403, 429) and retry_after and attempt < tries:
-                wait = min(float(retry_after), 60) + random.uniform(0, 1)
+            try:
+                ra_secs = float(retry_after) if retry_after else None
+            except ValueError:  # RFC 9110 also allows an HTTP-date; back off a fixed amount
+                ra_secs = 30.0
+            if e.code in (403, 429) and ra_secs is not None and attempt < tries:
+                wait = min(ra_secs, 60) + random.uniform(0, 1)
                 print(f"::warning::{label} rate-limited; waiting {wait:.1f}s per Retry-After")
                 time.sleep(wait)
                 continue
@@ -305,13 +310,20 @@ def upsert_comment(pr, body):
         print(f"::warning::could not post comment: {e}")
 
 def main():
-    ev = json.load(open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8"))
+    mode = FAIL_ON
+    with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as fh:
+        ev = json.load(fh)
     pr = (ev.get("pull_request") or {}).get("number") or ev.get("number")
     head = ((ev.get("pull_request") or {}).get("head") or {}).get("sha") or ""
+    base = ((ev.get("pull_request") or {}).get("base") or {}).get("sha") or ""
     ref_qs = f"?ref={head}" if head else ""
     if not pr:
+        if mode == "strict":
+            # A required check must not go green on an event that carries no pull request
+            # (merge_group, push, ...): nothing was reviewed.
+            print("::error::Not a pull_request event; strict mode reviews pull requests only and blocks here.")
+            return 1
         print("Not a pull_request event; nothing to gate."); return 0
-    mode = FAIL_ON
     for w in (_FAIL_ON_WARNING, _MAX_FILES_WARNING):
         if w:
             print(f"::warning::{w}")
@@ -341,14 +353,24 @@ def main():
 
     # Appeal channel: if the author (or their agent) contested prior findings with a proof in
     # .verificate/rebuttals.md, feed it to the gate so it can adjudicate and overturn sound rebuttals.
+    # In strict mode the rebuttals come from the PR's BASE commit, never its head: the PR being
+    # gated must not be able to overrule its own findings. A rebuttal takes effect once it has
+    # itself been reviewed and merged.
     rebuttal = ""
-    try:
-        rb = gh(f"/repos/{REPO}/contents/.verificate/rebuttals.md{ref_qs}")
-        rebuttal = base64.b64decode(rb["content"]).decode("utf-8", "replace")
-        if rebuttal.strip():
-            print("Verificate: rebuttals.md found — the gate will adjudicate contested findings.")
-    except Exception:
-        pass  # no rebuttals file is the normal case
+    rb_ref = (f"?ref={base}" if base else None) if mode == "strict" else ref_qs
+    if rb_ref is None:
+        print("::warning::strict mode: no base commit in the event, so no rebuttals are read.")
+    else:
+        try:
+            rb = gh(f"/repos/{REPO}/contents/.verificate/rebuttals.md{rb_ref}")
+            rebuttal = base64.b64decode(rb["content"]).decode("utf-8", "replace")
+            if rebuttal.strip():
+                print("Verificate: rebuttals.md found — the gate will adjudicate contested findings.")
+        except urllib.error.HTTPError as e:
+            if e.code != 404:  # 404 = no rebuttals file, the normal case
+                print(f"::warning::could not read .verificate/rebuttals.md (HTTP {e.code}); reviewing without rebuttals.")
+        except Exception as e:
+            print(f"::warning::could not read .verificate/rebuttals.md ({type(e).__name__}); reviewing without rebuttals.")
 
     rows, vetoed_any, rejected_any, errors, capped, fixes = [], False, False, 0, False, []
     for f in targets:
@@ -365,6 +387,13 @@ def main():
             errors += 1
             print(f"::warning::Verificate gate error on {f['filename']}: {type(e).__name__}: {str(e)[:160]}")
             rows.append((f["filename"], "⚠️ gate error (skipped)", "")); continue
+        if not isinstance(res, dict):
+            res = {"_unavailable": True, "text": "malformed gate response"}
+        # A malformed field must cost this one file, never abort the remaining reviews.
+        if not isinstance(res.get("protection", {}), dict) or not isinstance(res.get("assessment", {}), dict):
+            errors += 1
+            print(f"::warning::malformed gate response for {f['filename']}; treated as unreviewed.")
+            rows.append((f["filename"], "⚠️ malformed gate response", "")); continue
         if res.get("_unavailable"):
             errors += 1
             reason = res.get("reason", "")
