@@ -50,26 +50,36 @@ def main():
     for w in (_FAIL_ON_WARNING, _MAX_FILES_WARNING):
         if w:
             print(f"::warning::{w}")
+    if mode == "strict" and not head:
+        # Without the event's head SHA the contents would be read at the default branch.
+        print("::error::the event carries no pull request head SHA; strict mode blocks this run.")
+        set_output(verdict="error", files_reviewed=0, files_errored=0, files_dropped=0)
+        return 1
+
+    def head_moved():
+        """The file list describes the PR's CURRENT head; the contents are read at the event's
+        head. Checked before AND after listing, so a push in between cannot slip through."""
+        live = ((gh(f"/repos/{REPO}/pulls/{pr}").get("head") or {}).get("sha") or "")
+        if live != head:
+            print(f"::error::the pull request head moved ({head[:12]} -> {live[:12]}) since this event; "
+                  "strict mode blocks this run. The run for the new head gates it.")
+            set_output(verdict="error", files_reviewed=0, files_errored=0, files_dropped=0)
+            return True
+        return False
+
     try:
-        if mode == "strict" and head:
-            # The file list describes the PR's CURRENT head; the contents are read at the event's
-            # head. If they differ (a newer push), this run cannot vouch for either commit.
-            live_head = ((gh(f"/repos/{REPO}/pulls/{pr}").get("head") or {}).get("sha") or "")
-            if live_head != head:
-                print(f"::error::the pull request head moved ({head[:12]} -> {live_head[:12]}) since this event; "
-                      "strict mode blocks this run. The run for the new head gates it.")
-                set_output(verdict="error", files_reviewed=0, files_errored=0, files_dropped=0)
-                return 1
-        files = gh_all(f"/repos/{REPO}/pulls/{pr}/files")
-        if not isinstance(files, list):
-            raise ValueError("pull request file list is not a list")
+        if mode == "strict" and head_moved():
+            return 1
+        files, complete = gh_all(f"/repos/{REPO}/pulls/{pr}/files")
+        if mode == "strict" and head_moved():
+            return 1
     except Exception as e:
         if mode == "strict":
             print(f"::error::could not list files ({type(e).__name__}); strict mode blocks the merge.")
             set_output(verdict="error", files_reviewed=0, files_errored=0, files_dropped=0)
             return 1
         print(f"::warning::could not list files ({e}); failing open."); return 0
-    incomplete_list = len(files) >= GH_FILES_LIMIT
+    incomplete_list = (not complete) or len(files) >= GH_FILES_LIMIT
     if incomplete_list:
         print(f"::warning::the pull request lists {len(files)} files, GitHub's maximum; the list may be incomplete.")
     eligible = to_review(files, mode)
@@ -294,6 +304,11 @@ def entry():
     except Exception as e:
         if FAIL_ON == "strict":
             print(f"::error::Verificate Gate errored ({type(e).__name__}); strict mode blocks the merge.")
+            # Best effort: leave downstream jobs a verdict. A failure here must not mask the block.
+            try:
+                set_output(verdict="error", files_reviewed=0, files_errored=0, files_dropped=0)
+            except Exception as oe:
+                print(f"::warning::could not write step outputs ({type(oe).__name__}).")
             return 1
         print(f"::warning::Verificate Gate errored, failing open: {e}")
         return 0

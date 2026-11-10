@@ -83,19 +83,24 @@ def gh(path, method="GET", data=None):
     with _open(req, 30, label=f"github {method} {path[:60]}") as r:
         return json.loads(r.read() or b"{}")
 
+GH_MAX_PAGES = 30  # 30 x 100 = 3000, GitHub's ceiling for the pull request files list
+
+
 def gh_all(path):
-    """Follow per_page pagination so large PRs are fully enumerated."""
+    """Follow per_page pagination. Returns (items, complete): complete is False when the page
+    cap was reached on a full page, so the caller knows the list may be truncated and never
+    mistakes it for the whole set. A non-list page raises instead of being returned."""
     out, page = [], 1
     while True:
         chunk = gh(("&" if "?" in path else "?").join([path, f"per_page=100&page={page}"]))
         if not isinstance(chunk, list):
-            return chunk
+            raise ValueError(f"expected a list from {path[:60]}, got {type(chunk).__name__}")
         out += chunk
         if len(chunk) < 100:
-            return out
+            return out, True
+        if page >= GH_MAX_PAGES:
+            return out, False
         page += 1
-        if page > 30:
-            return out
 
 def set_output(**kv):
     path = os.environ.get("GITHUB_OUTPUT")
@@ -106,6 +111,7 @@ def set_output(**kv):
             f.write(f"{k}={str(v).replace(chr(13), ' ').replace(chr(10), ' ')}\n")
 
 MCP_MAX_RESPONSE = 4 * 1024 * 1024  # a verdict is a few KB; cap what a bad upstream can make us buffer
+REBUTTAL_MAX = 6000  # characters of .verificate/rebuttals.md sent as review context
 
 
 def _load_taint():
@@ -136,7 +142,11 @@ def mcp_validate(code, lang, rebuttal="", validation_type="code_generation", rea
             # Optional hint only: the review still runs, just without the reachability graph.
             print(f"::warning::taint analysis skipped ({type(e).__name__}); reviewing without the reachability hint.")
     if rebuttal:
-        ctx["rebuttal"] = rebuttal[:6000]
+        if len(rebuttal) > REBUTTAL_MAX:
+            print(f"::warning::.verificate/rebuttals.md is {len(rebuttal)} characters; only the first "
+                  f"{REBUTTAL_MAX} are sent. Put the methodology for each contested finding first.")
+            rebuttal = rebuttal[:REBUTTAL_MAX] + f"\n[rebuttals truncated at {REBUTTAL_MAX} characters]"
+        ctx["rebuttal"] = rebuttal
     def rpc(method, params, rid):
         body = json.dumps({"jsonrpc":"2.0","id":rid,"method":method,"params":params}).encode()
         h = {"Content-Type":"application/json","Accept":"application/json, text/event-stream",

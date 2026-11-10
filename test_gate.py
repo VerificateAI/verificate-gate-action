@@ -51,15 +51,16 @@ mcp_kwargs = []
 
 
 def run(mode, files, verdicts, *, list_error=None, crash=False, max_files=25, via_entry=False, spy=None,
-        live_head=None):
+        live_head=None, head_moves_after_list=False):
     """Run the gate once. verdicts maps filename -> verdict dict, or an Exception to raise."""
     gate.FAIL_ON, gate.MAX_FILES = mode, max_files
-    reviewed = []
+    reviewed, listed = [], []
 
     def gh_all(path):
         if list_error:
             raise list_error
-        return [dict(f) for f in files]
+        listed.append(1)
+        return [dict(f) for f in files], len(files) < gate.GH_FILES_LIMIT
 
     def gh(path, method="GET", data=None):
         if spy is not None:
@@ -69,7 +70,8 @@ def run(mode, files, verdicts, *, list_error=None, crash=False, max_files=25, vi
         if path.rstrip("/").split("/")[-2:-1] == ["pulls"]:  # GET /repos/o/r/pulls/{n}
             with open(_event.name, encoding="utf-8") as fh:
                 ev_head = ((json.load(fh).get("pull_request") or {}).get("head") or {}).get("sha")
-            return {"head": {"sha": ev_head if live_head is None else live_head}}
+            moved = live_head if (live_head is not None and (not head_moves_after_list or listed)) else None
+            return {"head": {"sha": ev_head if moved is None else moved}}
         return {"encoding": "base64", "content": base64.b64encode(b"x = 1\n").decode()}
 
     def mcp(code, lang, rebuttal="", **kw):
@@ -329,6 +331,45 @@ check("strict: main sends no reachability hint and types agent docs as documenta
 mcp_kwargs.clear()
 run("reject", one, {})
 check("reject: main keeps the reachability hint (unchanged)", [k.get("reachability_hint") for k in mcp_kwargs] == [True])
+
+# revision 6: gh_all contract, head SHA, head moved after listing, rebuttal truncation, entry outputs
+net = gate.net = importlib.reload(gate.net)
+pages = []
+net.gh = lambda path, method="GET", data=None: (pages.append(path), [{"filename": f"f{len(pages)}-{i}"} for i in range(100)])[1]
+items, complete = net.gh_all("/repos/o/r/pulls/1/files")
+check("gh_all: reaching the page cap on a full page reports incomplete", len(items) == 3000 and complete is False and len(pages) == 30)
+net.gh = lambda path, method="GET", data=None: [{"filename": "a"}]
+check("gh_all: a short last page reports complete", net.gh_all("/x") == ([{"filename": "a"}], True))
+net.gh = lambda path, method="GET", data=None: {"message": "Bad credentials"}
+try:
+    net.gh_all("/x")
+    check("gh_all: a non-list page raises instead of being returned as files", False)
+except ValueError:
+    check("gh_all: a non-list page raises instead of being returned as files", True)
+
+set_event({"pull_request": {"number": 7, "base": {"sha": "BASESHA"}}})
+rc, reviewed = run("strict", one, {})
+check("strict: an event without a head SHA blocks", rc == 1 and reviewed == [])
+rc, _ = run("reject", one, {})
+check("reject: an event without a head SHA still runs (unchanged)", rc == 0)
+set_event({"pull_request": {"number": 7, "head": {"sha": "HEADSHA"}, "base": {"sha": "BASESHA"}}})
+rc, reviewed = run("strict", one, {}, live_head="NEWERSHA", head_moves_after_list=True)
+check("strict: a head that moves while the files are listed blocks", rc == 1 and reviewed == [])
+
+sent.clear()
+net._OIDC_CACHE.append("")
+net._open = lambda req, timeout, tries=3, label="": (sent.append(json.loads(req.data)), _Resp(b'{"result":null}'))[1]
+net.mcp_validate("x=1", "python", rebuttal="r" * (net.REBUTTAL_MAX + 50))
+rb_sent = [s for s in sent if s.get("method") == "tools/call"][-1]["params"]["arguments"]["context"]["rebuttal"]
+check("a rebuttal over the limit is cut and the cut is marked", rb_sent.endswith("characters]") and len(rb_sent) < net.REBUTTAL_MAX + 60)
+
+outs = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8"); outs.close()
+os.environ["GITHUB_OUTPUT"] = outs.name
+rc, _ = run("strict", one, {}, crash=True, via_entry=True)
+with open(outs.name, encoding="utf-8") as fh:
+    out_text = fh.read()
+check("strict: an unexpected error still writes verdict=error for downstream jobs", rc == 1 and "verdict=error" in out_text)
+os.environ.pop("GITHUB_OUTPUT", None); os.unlink(outs.name)
 os.unlink(_event.name)
 
 print("\nGATE ACTION CONTRACT: " + ("FAILED %d" % len(fails) if fails else "PASSED"))
