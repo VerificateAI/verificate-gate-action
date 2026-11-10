@@ -34,7 +34,7 @@ outputs:
 runs:
   using: "composite"
   steps:
-    - uses: actions/setup-python@v5
+    - uses: actions/setup-python@v7
       with: { python-version: "3.11" }
     - id: gate
       run: python -I "${{ github.action_path }}/gate.py"
